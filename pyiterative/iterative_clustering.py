@@ -495,17 +495,18 @@ def dge_2samples(
     Returns
     -------
     pd.DataFrame
-        Results with columns: log2FC, p.value, p.value.adj, Chi2.p.value, pct.1, pct.2, Counts/Cell.1, Counts/Cell.2
+        Results with columns: log2FC, p.value, p.value.adj, Chi2.p.value, pct.1, pct.2
     """
     iwt = iter_wght_ttest(
         adata, features, ident_1, ident_2, groupby, fc_thr, min_pct, 
         max_pval, min_count, icc, df_correction, n_cores
     )
     
+    # Only run chi2_test on genes that passed the weighted t-test to save computation
     chi2 = chi2_test(
         adata, list(iwt.index), ident_1, ident_2, groupby, 
-        fc_thr=1.0, min_pct=min_pct, max_pval=1.0, 
-        min_count=min_count, n_cores=n_cores
+        fc_thr=1.0, min_pct=0.0, max_pval=1.0, 
+        min_count=0, n_cores=n_cores
     )
     
     # Merge results
@@ -539,7 +540,7 @@ def chi2_test(
     Returns
     -------
     pd.DataFrame
-        Results with columns: log2FC, p.value, Counts/Cell.1, Counts/Cell.2
+        Results with columns: log2FC, p.value
     """
     if ident_1 is None or ident_2 is None:
         raise ValueError("Both ident_1 and ident_2 must be defined")
@@ -565,6 +566,11 @@ def chi2_test(
     Ci_1 = X[mask_1, :]
     Ci_2 = X[mask_2, :]
     
+    # Convert to CSC for efficient column access
+    if sp.issparse(Ci_1):
+        Ci_1 = Ci_1.tocsc()
+        Ci_2 = Ci_2.tocsc()
+    
     Nc_1 = Ci_1.shape[0]
     Nc_2 = Ci_2.shape[0]
     
@@ -579,24 +585,29 @@ def chi2_test(
     TC_1 = AC_1.sum()
     TC_2 = AC_2.sum()
     
-    # Create gene name to index mapping
+    # Create gene name to index mapping and pre-filter valid genes
     gene_to_idx = {gene: idx for idx, gene in enumerate(var_names)}
+    valid_genes = [(gene, gene_to_idx[gene]) for gene in gene_list if gene in gene_to_idx]
     
-    def process_gene(gene_name):
-        if gene_name not in gene_to_idx:
-            return None
-        
-        idx = gene_to_idx[gene_name]
+    if len(valid_genes) == 0:
+        return pd.DataFrame(columns=['log2FC', 'p.value'])
+    
+    is_sparse = sp.issparse(Ci_1)
+    
+    def process_gene(args):
+        gene_name, idx = args
         ac1 = AC_1[idx]
         ac2 = AC_2[idx]
         
         # Get gene expression for min_pct calculation
-        if sp.issparse(Ci_1):
-            nonzero_1 = (Ci_1[:, idx].toarray().flatten() != 0).sum()
-            nonzero_2 = (Ci_2[:, idx].toarray().flatten() != 0).sum()
+        if is_sparse:
+            h_1 = Ci_1[:, idx].toarray().flatten()
+            h_2 = Ci_2[:, idx].toarray().flatten()
+            nonzero_1 = np.count_nonzero(h_1)
+            nonzero_2 = np.count_nonzero(h_2)
         else:
-            nonzero_1 = (Ci_1[:, idx] != 0).sum()
-            nonzero_2 = (Ci_2[:, idx] != 0).sum()
+            nonzero_1 = np.count_nonzero(Ci_1[:, idx])
+            nonzero_2 = np.count_nonzero(Ci_2[:, idx])
         
         pct_1 = nonzero_1 / Nc_1
         pct_2 = nonzero_2 / Nc_2
@@ -616,9 +627,7 @@ def chi2_test(
                     return {
                         'gene': gene_name,
                         'log2FC': np.log2(fc),
-                        'p.value': p_value,
-                        'Counts/Cell.1': ac1 / Nc_1,
-                        'Counts/Cell.2': ac2 / Nc_2
+                        'p.value': p_value
                     }
         return None
     
@@ -626,15 +635,15 @@ def chi2_test(
     
     if n_cores > 1:
         with Pool(n_cores) as pool:
-            results = list(tqdm(pool.imap(process_gene, gene_list), total=len(gene_list)))
+            results = list(tqdm(pool.imap(process_gene, valid_genes), total=len(valid_genes)))
     else:
-        results = [process_gene(gene) for gene in tqdm(gene_list)]
+        results = [process_gene(args) for args in tqdm(valid_genes)]
     
     # Filter None results and create DataFrame
     results = [r for r in results if r is not None]
     
     if len(results) == 0:
-        return pd.DataFrame(columns=['log2FC', 'p.value', 'Counts/Cell.1', 'Counts/Cell.2'])
+        return pd.DataFrame(columns=['log2FC', 'p.value'])
     
     output = pd.DataFrame(results)
     output.set_index('gene', inplace=True)
@@ -644,36 +653,26 @@ def chi2_test(
 
 def _process_gene_weighted_ttest(args):
     """Helper function for parallel processing in iter_wght_ttest."""
-    gene_name, gene_to_idx, Ci_1, Ci_2, Xi_1, Xi_2, Ni_1, Ni_2, Nc_1, Nc_2, min_count, min_pct, fc_thr, max_pval, icc, df_correction = args
-    
-    if gene_name not in gene_to_idx:
-        return None
-    
-    idx = gene_to_idx[gene_name]
+    gene_name, idx, Ci_1, Ci_2, Xi_1, Xi_2, Ni_1, Ni_2, Nc_1, Nc_2, min_count, min_pct, fc_thr, max_pval, icc, df_correction, is_sparse = args
     
     # Get counts for this gene
-    if sp.issparse(Ci_1):
-        h_1_col = Ci_1[:, idx]
-        h_2_col = Ci_2[:, idx]
-        h_1 = h_1_col.toarray().flatten()
-        h_2 = h_2_col.toarray().flatten()
+    if is_sparse:
+        # CSC format allows efficient column slicing
+        h_1 = Ci_1[:, idx].toarray().flatten()
+        h_2 = Ci_2[:, idx].toarray().flatten()
         xi_1 = Xi_1[:, idx].toarray().flatten()
         xi_2 = Xi_2[:, idx].toarray().flatten()
         
-        # Use scipy.sparse method for efficient nonzero counting
-        if hasattr(h_1_col, 'count_nonzero'):
-            nonzero_1 = h_1_col.count_nonzero()
-            nonzero_2 = h_2_col.count_nonzero()
-        else:
-            nonzero_1 = (h_1 != 0).sum()
-            nonzero_2 = (h_2 != 0).sum()
+        # Count nonzeros efficiently
+        nonzero_1 = np.count_nonzero(h_1)
+        nonzero_2 = np.count_nonzero(h_2)
     else:
         h_1 = Ci_1[:, idx]
         h_2 = Ci_2[:, idx]
         xi_1 = Xi_1[:, idx]
         xi_2 = Xi_2[:, idx]
-        nonzero_1 = (xi_1 != 0).sum()
-        nonzero_2 = (xi_2 != 0).sum()
+        nonzero_1 = np.count_nonzero(xi_1)
+        nonzero_2 = np.count_nonzero(xi_2)
     
     AC_1 = h_1.sum()
     AC_2 = h_2.sum()
@@ -703,9 +702,7 @@ def _process_gene_weighted_ttest(args):
                     'log2FC': np.log2(fc),
                     'p.value': p_value,
                     'pct.1': pct_1,
-                    'pct.2': pct_2,
-                    'Counts/Cell.1': AC_1 / Nc_1,
-                    'Counts/Cell.2': AC_2 / Nc_2
+                    'pct.2': pct_2
                 }
     return None
 
@@ -730,7 +727,7 @@ def iter_wght_ttest(
     Returns
     -------
     pd.DataFrame
-        Results with columns: log2FC, p.value, p.value.adj, pct.1, pct.2, Counts/Cell.1, Counts/Cell.2
+        Results with columns: log2FC, p.value, p.value.adj, pct.1, pct.2
     """
     if ident_1 is None or ident_2 is None:
         raise ValueError("Both ident_1 and ident_2 must be defined")
@@ -756,6 +753,11 @@ def iter_wght_ttest(
     Ci_1 = X[mask_1, :]
     Ci_2 = X[mask_2, :]
     
+    # Convert to CSC format for faster column access
+    if sp.issparse(Ci_1):
+        Ci_1 = Ci_1.tocsc()
+        Ci_2 = Ci_2.tocsc()
+    
     Nc_1 = Ci_1.shape[0]
     Nc_2 = Ci_2.shape[0]
     
@@ -771,26 +773,33 @@ def iter_wght_ttest(
     if sp.issparse(Ci_1):
         Xi_1 = Ci_1.multiply(1 / Ni_1[:, np.newaxis])
         Xi_2 = Ci_2.multiply(1 / Ni_2[:, np.newaxis])
-        # Convert to CSR format to support column indexing
-        Xi_1 = Xi_1.tocsr()
-        Xi_2 = Xi_2.tocsr()
+        # Convert to CSC format for efficient column access (already done for Ci_1/Ci_2)
+        Xi_1 = Xi_1.tocsc()
+        Xi_2 = Xi_2.tocsc()
     else:
         Xi_1 = Ci_1 / Ni_1[:, np.newaxis]
         Xi_2 = Ci_2 / Ni_2[:, np.newaxis]
     
-    # Create gene name to index mapping
+    # Create gene name to index mapping and filter genes that exist
     gene_to_idx = {gene: idx for idx, gene in enumerate(var_names)}
+    valid_genes = [(gene, gene_to_idx[gene]) for gene in gene_list if gene in gene_to_idx]
+    
+    if len(valid_genes) == 0:
+        return pd.DataFrame(columns=['log2FC', 'p.value', 'p.value.adj', 'pct.1', 'pct.2'])
     
     print("Performing weighted t-test:")
     
+    # Check if we should use sparse or dense format
+    is_sparse = sp.issparse(Ci_1)
+    
     # Prepare arguments for parallel processing
-    args_list = [(gene, gene_to_idx, Ci_1, Ci_2, Xi_1, Xi_2, Ni_1, Ni_2, Nc_1, Nc_2, 
-                  min_count, min_pct, fc_thr, max_pval, icc, df_correction) 
-                 for gene in gene_list]
+    args_list = [(gene, idx, Ci_1, Ci_2, Xi_1, Xi_2, Ni_1, Ni_2, Nc_1, Nc_2, 
+                  min_count, min_pct, fc_thr, max_pval, icc, df_correction, is_sparse) 
+                 for gene, idx in valid_genes]
     
     if n_cores > 1:
         with Pool(n_cores) as pool:
-            results = list(tqdm(pool.imap(_process_gene_weighted_ttest, args_list), total=len(gene_list)))
+            results = list(tqdm(pool.imap(_process_gene_weighted_ttest, args_list), total=len(valid_genes)))
     else:
         results = [_process_gene_weighted_ttest(args) for args in tqdm(args_list)]
     
@@ -798,7 +807,7 @@ def iter_wght_ttest(
     results = [r for r in results if r is not None]
     
     if len(results) == 0:
-        return pd.DataFrame(columns=['log2FC', 'p.value', 'p.value.adj', 'pct.1', 'pct.2', 'Counts/Cell.1', 'Counts/Cell.2'])
+        return pd.DataFrame(columns=['log2FC', 'p.value', 'p.value.adj', 'pct.1', 'pct.2'])
     
     output = pd.DataFrame(results)
     output.set_index('gene', inplace=True)
