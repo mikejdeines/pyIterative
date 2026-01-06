@@ -153,10 +153,25 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
         cluster_adata.layers['counts'] = cluster_adata.X.copy()
         sc.pp.normalize_total(cluster_adata, target_sum=1e4)
         sc.pp.log1p(cluster_adata)
-        sc.pp.highly_variable_genes(cluster_adata, n_top_genes=3000, subset=False, flavor='seurat_v3', layer='counts')
+        
+        # Try to find highly variable genes with error handling
+        try:
+            # Adjust n_top_genes if there are fewer genes available
+            n_genes = min(3000, cluster_adata.n_vars)
+            sc.pp.highly_variable_genes(cluster_adata, n_top_genes=n_genes, subset=False, flavor='seurat_v3', layer='counts')
+        except (ValueError, RuntimeError) as e:
+            # If seurat_v3 fails (e.g., LOESS singularities), skip this cluster
+            print(f"Warning: seurat_v3 HVG failed for cluster {cluster} ({str(e)}), skipping cluster")
+            continue
         
         # Subset to highly variable genes for Concord
         hvg_genes = cluster_adata.var_names[cluster_adata.var['highly_variable']].tolist()
+        
+        # If no HVG found, skip this cluster
+        if len(hvg_genes) == 0:
+            print(f"Warning: No highly variable genes found for cluster {cluster}, skipping")
+            continue
+            
         cluster_adata_hvg = cluster_adata[:, hvg_genes].copy()
         
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
