@@ -150,7 +150,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
         sc.pp.normalize_total(cluster_adata, target_sum=1e4)
         sc.pp.log1p(cluster_adata)
         sc.pp.highly_variable_genes(cluster_adata, n_top_genes=3000, subset=False, flavor='seurat_v3', layer='counts')
-        hvgs = cluster_adata.var['highly_variable']
+        hvgs = cluster_adata.var['highly_variable'].tolist()
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         ccd_model = ccd.Concord(adata=cluster_adata, input_feature=hvgs, domain_key=batch_key, 
                                 device=device, preload_dense=False, batch_size=batch_size, latent_dim=ndims,
