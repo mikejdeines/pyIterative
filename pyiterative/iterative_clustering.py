@@ -150,12 +150,19 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
         sc.pp.normalize_total(cluster_adata, target_sum=1e4)
         sc.pp.log1p(cluster_adata)
         sc.pp.highly_variable_genes(cluster_adata, n_top_genes=3000, subset=False, flavor='seurat_v3', layer='counts')
-        hvgs = cluster_adata.var['highly_variable'].tolist()
+        
+        # Subset to highly variable genes for Concord
+        hvg_genes = cluster_adata.var_names[cluster_adata.var['highly_variable']].tolist()
+        cluster_adata_hvg = cluster_adata[:, hvg_genes].copy()
+        
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-        ccd_model = ccd.Concord(adata=cluster_adata, input_feature=hvgs, domain_key=batch_key, 
+        ccd_model = ccd.Concord(adata=cluster_adata_hvg, domain_key=batch_key, 
                                 device=device, preload_dense=False, batch_size=batch_size, latent_dim=ndims,
                                 encoder_dims=[int(2**(np.floor(np.sqrt(ndims))+1))]) # Use encoder_dims = 2^(floor(sqrt(ndims))+1)
         ccd_model.fit_transform(output_key='Concord')
+        
+        # Transfer the Concord embedding back to the original cluster_adata
+        cluster_adata.obsm['Concord'] = cluster_adata_hvg.obsm['Concord']
 
         if cluster_adata.n_obs < min_cluster_size:
             continue
