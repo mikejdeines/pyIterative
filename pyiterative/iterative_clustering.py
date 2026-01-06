@@ -413,7 +413,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
     adata.obs['leiden'] = adata.obs['leiden'].cat.remove_unused_categories()
     print('Clustering iteration complete. Number of clusters:', len(adata.obs['leiden'].cat.categories))
     return adata
-def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes):
+def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes, DE_batch_size=2048):
     """
     Calculate differential expression score between two identities.
     Args:
@@ -423,6 +423,7 @@ def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes):
         min_pct: Minimum percentage of cells expressing a gene to consider it for differential expression.
         min_log2_fc: Minimum log2 fold change for a gene to be considered differentially expressed.
         min_de_genes: Minimum number of differentially expressed genes required (returns score of 0 if below threshold).
+        DE_batch_size: Batch size for GPU processing in dge_2samples (default: 2048).
     Returns:
         de_score: Differential expression score sum(min(-log10(p),20)).
     """
@@ -437,7 +438,8 @@ def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes):
         min_count=10,
         icc='i',
         df_correction=False,
-        n_cores=max(1, cpu_count() - 1)
+        n_cores=max(1, cpu_count() - 1),
+        gpu_batch_size=DE_batch_size
     )
     
     # Count number of DE genes meeting criteria
@@ -446,7 +448,7 @@ def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes):
         (de_results['p.value.adj'] <= 0.05)
     ]
 
-    de_genes = de_genes[de_genes['pct.1'] >= min_pct | de_genes['pct.2'] >= min_pct]
+    de_genes = de_genes[(de_genes['pct.1'] >= min_pct) | (de_genes['pct.2'] >= min_pct)]
         
     if de_genes.shape[0] < min_de_genes:
         return 0
@@ -466,7 +468,7 @@ def dge_2samples(
     df_correction: bool = False,
     n_cores: int = 1,
     use_gpu: bool = True,
-    gpu_batch_size: int = 1000
+    gpu_batch_size: int = 2048
 ) -> pd.DataFrame:
     """
     Analyze differential gene expression between 2 identities using weighted t-test and chi-squared test.
@@ -500,7 +502,7 @@ def dge_2samples(
     use_gpu : bool
         Use GPU acceleration for chi-squared test (default: True if CUDA available)
     gpu_batch_size : int
-        Number of genes to process per GPU batch (default: 1000)
+        Number of genes to process per GPU batch (default: 2048)
         
     Returns
     -------
