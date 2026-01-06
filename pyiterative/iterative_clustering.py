@@ -1027,7 +1027,8 @@ def iter_wght_ttest_gpu(
     icc: Union[str, float] = 'i',
     df_correction: bool = False,
     batch_size: int = 500,
-    device: Optional[torch.device] = None
+    device: Optional[torch.device] = None,
+    n_cores: int = 1
 ) -> pd.DataFrame:
     """
     GPU-accelerated weighted t-test with iterative weight calculation.
@@ -1041,6 +1042,8 @@ def iter_wght_ttest_gpu(
         Number of genes to process in parallel on GPU (default: 500)
     device : torch.device, optional
         Device to use. If None, uses CUDA if available
+    n_cores : int
+        Number of CPU cores for parallel ICC weight computation (default: 1)
         
     Returns
     -------
@@ -1152,15 +1155,12 @@ def iter_wght_ttest_gpu(
         if not valid_mask.any():
             continue
         
-        # Compute ICC weights on CPU (fast enough, hard to parallelize)
-        w1_list = []
-        w2_list = []
-        for i in range(len(batch_genes)):
-            if valid_mask[i]:
-                w1 = icc_weight(h1_batch[i], Ni_1, icc)
-                w2 = icc_weight(h2_batch[i], Ni_2, icc)
-                w1_list.append(w1)
-                w2_list.append(w2)
+        # Compute ICC weights on CPU with parallelization
+        valid_h1 = [h1_batch[i] for i in range(len(batch_genes)) if valid_mask[i]]
+        valid_h2 = [h2_batch[i] for i in range(len(batch_genes)) if valid_mask[i]]
+        
+        w1_list = compute_icc_weights_parallel(valid_h1, Ni_1, icc, n_cores)
+        w2_list = compute_icc_weights_parallel(valid_h2, Ni_2, icc, n_cores)
         
         if len(w1_list) == 0:
             continue
@@ -1265,7 +1265,7 @@ def iter_wght_ttest(
     if use_gpu and _GPU_AVAILABLE:
         return iter_wght_ttest_gpu(
             adata, features, ident_1, ident_2, groupby, fc_thr, min_pct,
-            max_pval, min_count, icc, df_correction, gpu_batch_size
+            max_pval, min_count, icc, df_correction, gpu_batch_size, n_cores=n_cores
         )
     
     # Fall back to CPU version
@@ -1544,6 +1544,55 @@ def icc_iter(h: np.ndarray, n: np.ndarray) -> float:
         return min(icc_val, 1.0)
     except ValueError:
         return 0.0
+
+
+def _compute_icc_weight_single(args):
+    """
+    Helper function for parallel ICC weight computation.
+    
+    Parameters
+    ----------
+    args : tuple
+        (h, n, icc) where h is count array, n is total counts, icc is ICC method
+        
+    Returns
+    -------
+    array
+        Normalized weights
+    """
+    h, n, icc = args
+    return icc_weight(h, n, icc)
+
+
+def compute_icc_weights_parallel(h_list, n, icc, n_cores=1):
+    """
+    Compute ICC weights for multiple genes in parallel.
+    
+    Parameters
+    ----------
+    h_list : list of arrays
+        List of count arrays, one per gene
+    n : array
+        Total counts per observation (same for all genes)
+    icc : str or float
+        ICC method: 'i' (iterative), 'A' (ANOVA), 0, or 1
+    n_cores : int
+        Number of CPU cores to use
+        
+    Returns
+    -------
+    list of arrays
+        List of weight arrays, one per gene
+    """
+    if n_cores <= 1 or len(h_list) < n_cores:
+        # Sequential processing for small workloads or single core
+        return [icc_weight(h, n, icc) for h in h_list]
+    
+    # Parallel processing
+    args_list = [(h, n, icc) for h in h_list]
+    with Pool(n_cores) as pool:
+        weights = pool.map(_compute_icc_weight_single, args_list)
+    return weights
 
 
 def icc_weight(h: np.ndarray, n: np.ndarray, icc: Union[str, float] = 'i') -> np.ndarray:
