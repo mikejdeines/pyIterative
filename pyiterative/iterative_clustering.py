@@ -1546,27 +1546,9 @@ def icc_iter(h: np.ndarray, n: np.ndarray) -> float:
         return 0.0
 
 
-def _compute_icc_weight_single(args):
-    """
-    Helper function for parallel ICC weight computation.
-    
-    Parameters
-    ----------
-    args : tuple
-        (h, n, icc) where h is count array, n is total counts, icc is ICC method
-        
-    Returns
-    -------
-    array
-        Normalized weights
-    """
-    h, n, icc = args
-    return icc_weight(h, n, icc)
-
-
 def compute_icc_weights_parallel(h_list, n, icc, n_cores=1):
     """
-    Compute ICC weights for multiple genes in parallel.
+    Compute ICC weights for multiple genes sequentially.
     
     Parameters
     ----------
@@ -1577,22 +1559,15 @@ def compute_icc_weights_parallel(h_list, n, icc, n_cores=1):
     icc : str or float
         ICC method: 'i' (iterative), 'A' (ANOVA), 0, or 1
     n_cores : int
-        Number of CPU cores to use
+        Unused parameter (kept for backward compatibility)
         
     Returns
     -------
     list of arrays
         List of weight arrays, one per gene
     """
-    if n_cores <= 1 or len(h_list) < n_cores:
-        # Sequential processing for small workloads or single core
-        return [icc_weight(h, n, icc) for h in h_list]
-    
-    # Parallel processing
-    args_list = [(h, n, icc) for h in h_list]
-    with Pool(n_cores) as pool:
-        weights = pool.map(_compute_icc_weight_single, args_list)
-    return weights
+    # Sequential processing (parallelization removed for performance)
+    return [icc_weight(h, n, icc) for h in h_list]
 
 
 def icc_weight(h: np.ndarray, n: np.ndarray, icc: Union[str, float] = 'i') -> np.ndarray:
