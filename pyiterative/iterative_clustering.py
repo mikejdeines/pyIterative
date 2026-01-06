@@ -771,6 +771,9 @@ def iter_wght_ttest(
     if sp.issparse(Ci_1):
         Xi_1 = Ci_1.multiply(1 / Ni_1[:, np.newaxis])
         Xi_2 = Ci_2.multiply(1 / Ni_2[:, np.newaxis])
+        # Convert to CSR format to support column indexing
+        Xi_1 = Xi_1.tocsr()
+        Xi_2 = Xi_2.tocsr()
     else:
         Xi_1 = Ci_1 / Ni_1[:, np.newaxis]
         Xi_2 = Ci_2 / Ni_2[:, np.newaxis]
