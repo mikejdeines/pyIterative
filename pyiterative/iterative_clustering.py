@@ -158,7 +158,8 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
         try:
             # Adjust n_top_genes if there are fewer genes available
             n_genes = min(3000, cluster_adata.n_vars)
-            sc.pp.highly_variable_genes(cluster_adata, n_top_genes=n_genes, subset=False, flavor='seurat_v3', layer='counts')
+            sc.pp.highly_variable_genes(cluster_adata, n_top_genes=n_genes, subset=False, flavor='seurat_v3', layer='counts',
+                                        span=0.5)
         except (ValueError, RuntimeError) as e:
             # If seurat_v3 fails (e.g., LOESS singularities), skip this cluster
             print(f"Warning: seurat_v3 HVG failed for cluster {cluster} ({str(e)}), skipping cluster")
