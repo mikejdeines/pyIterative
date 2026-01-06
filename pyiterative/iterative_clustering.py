@@ -642,6 +642,74 @@ def chi2_test(
     return output
 
 
+def _process_gene_weighted_ttest(args):
+    """Helper function for parallel processing in iter_wght_ttest."""
+    gene_name, gene_to_idx, Ci_1, Ci_2, Xi_1, Xi_2, Ni_1, Ni_2, Nc_1, Nc_2, min_count, min_pct, fc_thr, max_pval, icc, df_correction = args
+    
+    if gene_name not in gene_to_idx:
+        return None
+    
+    idx = gene_to_idx[gene_name]
+    
+    # Get counts for this gene
+    if sp.issparse(Ci_1):
+        h_1_col = Ci_1[:, idx]
+        h_2_col = Ci_2[:, idx]
+        h_1 = h_1_col.toarray().flatten()
+        h_2 = h_2_col.toarray().flatten()
+        xi_1 = Xi_1[:, idx].toarray().flatten()
+        xi_2 = Xi_2[:, idx].toarray().flatten()
+        
+        # Use scipy.sparse method for efficient nonzero counting
+        if hasattr(h_1_col, 'count_nonzero'):
+            nonzero_1 = h_1_col.count_nonzero()
+            nonzero_2 = h_2_col.count_nonzero()
+        else:
+            nonzero_1 = (h_1 != 0).sum()
+            nonzero_2 = (h_2 != 0).sum()
+    else:
+        h_1 = Ci_1[:, idx]
+        h_2 = Ci_2[:, idx]
+        xi_1 = Xi_1[:, idx]
+        xi_2 = Xi_2[:, idx]
+        nonzero_1 = (xi_1 != 0).sum()
+        nonzero_2 = (xi_2 != 0).sum()
+    
+    AC_1 = h_1.sum()
+    AC_2 = h_2.sum()
+    
+    pct_1 = nonzero_1 / Nc_1
+    pct_2 = nonzero_2 / Nc_2
+    
+    if (AC_1 >= min_count or AC_2 >= min_count) and \
+       (pct_1 > min_pct or pct_2 > min_pct):
+        
+        wi_1 = icc_weight(h_1, Ni_1, icc)
+        wi_2 = icc_weight(h_2, Ni_2, icc)
+        
+        fc = (xi_1 * wi_1).sum() / (xi_2 * wi_2).sum() if (xi_2 * wi_2).sum() > 0 else np.nan
+        
+        if not np.isnan(fc) and (fc >= fc_thr or fc <= 1/fc_thr) and \
+           (nonzero_1 >= 3 or nonzero_2 >= 3):
+            
+            if df_correction:
+                p_value = alt_wttest2(xi_1, xi_2, wi_1, wi_2)
+            else:
+                p_value = alt_wttest(xi_1, xi_2, wi_1, wi_2)
+            
+            if p_value <= max_pval:
+                return {
+                    'gene': gene_name,
+                    'log2FC': np.log2(fc),
+                    'p.value': p_value,
+                    'pct.1': pct_1,
+                    'pct.2': pct_2,
+                    'Counts/Cell.1': AC_1 / Nc_1,
+                    'Counts/Cell.2': AC_2 / Nc_2
+                }
+    return None
+
+
 def iter_wght_ttest(
     adata,
     features: Optional[List[str]] = None,
@@ -710,77 +778,18 @@ def iter_wght_ttest(
     # Create gene name to index mapping
     gene_to_idx = {gene: idx for idx, gene in enumerate(var_names)}
     
-    def process_gene(gene_name):
-        if gene_name not in gene_to_idx:
-            return None
-        
-        idx = gene_to_idx[gene_name]
-        
-        # Get counts for this gene
-        if sp.issparse(Ci_1):
-            h_1_col = Ci_1[:, idx]
-            h_2_col = Ci_2[:, idx]
-            h_1 = h_1_col.toarray().flatten()
-            h_2 = h_2_col.toarray().flatten()
-            xi_1 = Xi_1[:, idx].toarray().flatten()
-            xi_2 = Xi_2[:, idx].toarray().flatten()
-            
-            # Use scipy.sparse method for efficient nonzero counting
-            if hasattr(h_1_col, 'count_nonzero'):
-                nonzero_1 = h_1_col.count_nonzero()
-                nonzero_2 = h_2_col.count_nonzero()
-            else:
-                nonzero_1 = (h_1 != 0).sum()
-                nonzero_2 = (h_2 != 0).sum()
-        else:
-            h_1 = Ci_1[:, idx]
-            h_2 = Ci_2[:, idx]
-            xi_1 = Xi_1[:, idx]
-            xi_2 = Xi_2[:, idx]
-            nonzero_1 = (xi_1 != 0).sum()
-            nonzero_2 = (xi_2 != 0).sum()
-        
-        AC_1 = h_1.sum()
-        AC_2 = h_2.sum()
-        
-        pct_1 = nonzero_1 / Nc_1
-        pct_2 = nonzero_2 / Nc_2
-        
-        if (AC_1 >= min_count or AC_2 >= min_count) and \
-           (pct_1 > min_pct or pct_2 > min_pct):
-            
-            wi_1 = icc_weight(h_1, Ni_1, icc)
-            wi_2 = icc_weight(h_2, Ni_2, icc)
-            
-            fc = (xi_1 * wi_1).sum() / (xi_2 * wi_2).sum() if (xi_2 * wi_2).sum() > 0 else np.nan
-            
-            if not np.isnan(fc) and (fc >= fc_thr or fc <= 1/fc_thr) and \
-               (nonzero_1 >= 3 or nonzero_2 >= 3):
-                
-                if df_correction:
-                    p_value = alt_wttest2(xi_1, xi_2, wi_1, wi_2)
-                else:
-                    p_value = alt_wttest(xi_1, xi_2, wi_1, wi_2)
-                
-                if p_value <= max_pval:
-                    return {
-                        'gene': gene_name,
-                        'log2FC': np.log2(fc),
-                        'p.value': p_value,
-                        'pct.1': pct_1,
-                        'pct.2': pct_2,
-                        'Counts/Cell.1': AC_1 / Nc_1,
-                        'Counts/Cell.2': AC_2 / Nc_2
-                    }
-        return None
-    
     print("Performing weighted t-test:")
+    
+    # Prepare arguments for parallel processing
+    args_list = [(gene, gene_to_idx, Ci_1, Ci_2, Xi_1, Xi_2, Ni_1, Ni_2, Nc_1, Nc_2, 
+                  min_count, min_pct, fc_thr, max_pval, icc, df_correction) 
+                 for gene in gene_list]
     
     if n_cores > 1:
         with Pool(n_cores) as pool:
-            results = list(tqdm(pool.imap(process_gene, gene_list), total=len(gene_list)))
+            results = list(tqdm(pool.imap(_process_gene_weighted_ttest, args_list), total=len(gene_list)))
     else:
-        results = [process_gene(gene) for gene in tqdm(gene_list)]
+        results = [_process_gene_weighted_ttest(args) for args in tqdm(args_list)]
     
     # Filter None results and create DataFrame
     results = [r for r in results if r is not None]
