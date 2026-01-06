@@ -256,64 +256,84 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
                 
             centroid_map = {subcluster: i for i, subcluster in enumerate(nonempty_sub_clusters)}
             
-            min_distance = np.inf
-            closest_pair = None
+            # Build list of all pairs with their distances
+            from sklearn.metrics import pairwise_distances
+            all_pairs = []
             
             for sub_cluster in nonempty_sub_clusters:
                 if sub_cluster not in centroid_map:
                     continue
                 
-                # Use the refactored Find_Nearest_Cluster function
+                # Find nearest cluster
                 closest_sub_cluster = Find_Nearest_Cluster(centroids, nonempty_sub_clusters, sub_cluster)
                 
                 if closest_sub_cluster is None:
                     continue
                 
+                # Skip if already tested
                 if (sub_cluster, str(closest_sub_cluster)) in merged_pairs or (str(closest_sub_cluster), sub_cluster) in merged_pairs:
                     continue
                 
-                # Calculate distance between the pair for comparison
+                # Calculate distance
                 idx = centroid_map[sub_cluster]
                 closest_idx = centroid_map.get(closest_sub_cluster)
                 
                 if closest_idx is None or idx >= centroids.shape[0] or closest_idx >= centroids.shape[0]:
                     continue
                 
-                from sklearn.metrics import pairwise_distances
                 distance = pairwise_distances(centroids[idx:idx+1], centroids[closest_idx:closest_idx+1])[0][0]
                 
-                if distance < min_distance:
-                    min_distance = distance
-                    closest_pair = (sub_cluster, closest_sub_cluster)
+                # Store pair with canonical ordering to avoid duplicates
+                pair_key = tuple(sorted([sub_cluster, closest_sub_cluster]))
+                all_pairs.append((distance, pair_key[0], pair_key[1]))
             
-            if closest_pair is None:
+            # Remove duplicate pairs and sort by distance
+            seen_pairs = set()
+            unique_pairs = []
+            for dist, c1, c2 in all_pairs:
+                pair_key = tuple(sorted([c1, c2]))
+                if pair_key not in seen_pairs:
+                    seen_pairs.add(pair_key)
+                    unique_pairs.append((dist, c1, c2))
+            
+            unique_pairs.sort(key=lambda x: x[0])  # Sort by distance (closest first)
+            
+            if len(unique_pairs) == 0:
                 break
-                
-            sub_cluster, closest_sub_cluster = closest_pair
-                
-            n_cells_sub = np.sum(cluster_adata.obs['leiden'] == sub_cluster)
-            n_cells_closest = np.sum(cluster_adata.obs['leiden'] == closest_sub_cluster)
             
-            # Force merge if either cluster is too small (regardless of DE score)
-            if n_cells_sub < min_cluster_size or n_cells_closest < min_cluster_size:
-                print(f"Force merging small sub-clusters: {sub_cluster} ({n_cells_sub} cells) with {closest_sub_cluster} ({n_cells_closest} cells)")
-                cluster_adata.obs.loc[cluster_adata.obs['leiden'] == closest_sub_cluster, 'leiden'] = sub_cluster
-                merged_pairs.append((sub_cluster, str(closest_sub_cluster)))
-                changes_made = True
-                continue
-            
-            # Skip DE analysis if clusters are too small for reliable DE (but above min_cluster_size)
-            if n_cells_sub < 3 or n_cells_closest < 3:
-                merged_pairs.append((sub_cluster, str(closest_sub_cluster)))
-                continue
+            # Test pairs in order from closest to farthest
+            for distance, sub_cluster, closest_sub_cluster in unique_pairs:
+                # Check if pair was already tested
+                if (sub_cluster, str(closest_sub_cluster)) in merged_pairs or (str(closest_sub_cluster), sub_cluster) in merged_pairs:
+                    continue
                 
-            # Perform differential expression analysis for larger clusters
-            bayes_de_score = DE_Score(cluster_adata, sub_cluster, closest_sub_cluster, min_pct, min_log2_fc, min_de_genes)
-            
-            if bayes_de_score < min_score:
-                cluster_adata.obs.loc[cluster_adata.obs['leiden'] == closest_sub_cluster, 'leiden'] = sub_cluster
-                merged_pairs.append((sub_cluster, str(closest_sub_cluster)))
-                changes_made = True
+                n_cells_sub = np.sum(cluster_adata.obs['leiden'] == sub_cluster)
+                n_cells_closest = np.sum(cluster_adata.obs['leiden'] == closest_sub_cluster)
+                
+                # Force merge if either cluster is too small (regardless of DE score)
+                if n_cells_sub < min_cluster_size or n_cells_closest < min_cluster_size:
+                    print(f"Force merging small sub-clusters: {sub_cluster} ({n_cells_sub} cells) with {closest_sub_cluster} ({n_cells_closest} cells)")
+                    cluster_adata.obs.loc[cluster_adata.obs['leiden'] == closest_sub_cluster, 'leiden'] = sub_cluster
+                    merged_pairs.append((sub_cluster, str(closest_sub_cluster)))
+                    changes_made = True
+                    break  # Recalculate after merge
+                
+                # Skip DE analysis if clusters are too small for reliable DE (but above min_cluster_size)
+                if n_cells_sub < 3 or n_cells_closest < 3:
+                    merged_pairs.append((sub_cluster, str(closest_sub_cluster)))
+                    continue
+                    
+                # Perform differential expression analysis for larger clusters
+                bayes_de_score = DE_Score(cluster_adata, sub_cluster, closest_sub_cluster, min_pct, min_log2_fc, min_de_genes)
+                
+                if bayes_de_score < min_score:
+                    cluster_adata.obs.loc[cluster_adata.obs['leiden'] == closest_sub_cluster, 'leiden'] = sub_cluster
+                    merged_pairs.append((sub_cluster, str(closest_sub_cluster)))
+                    changes_made = True
+                    break  # Recalculate after merge
+                else:
+                    # Mark pair as tested but not merged
+                    merged_pairs.append((sub_cluster, str(closest_sub_cluster)))
         
         cluster_adata.obs['leiden'] = cluster_adata.obs['leiden'].cat.remove_unused_categories()
         
