@@ -166,46 +166,45 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
 
         if cluster_adata.n_obs < min_cluster_size:
             continue
-
+        print('Creating sNN graph...')
         if cluster_adata.n_obs < 20:
             k = int(np.floor(cluster_adata.n_obs/2))
-            idx, distance = NNDescent(cluster_adata.obsm['Concord'][:, :ndims], n_neighbors=k).neighbor_graph
-            idx = idx[:, 1:] # Drop self from sNN
-            n_cells = idx.shape[0]
-            snn = lil_matrix((n_cells, n_cells), dtype=np.float32)
-            neighbor_sets = [set(row) for row in idx]
-            for i in range(n_cells):
-                ni = neighbor_sets[i]
-                for j in idx[i]:
-                    shared = len(ni.intersection(neighbor_sets[j]))
-                    if shared > 0:
-                        snn[i, j] = shared/k
-            snn = snn.maximum(snn.T)
-            snn[snn < (1/15)] = 0
-            cluster_adata.obsp['connectivities'] = csr_matrix(snn)
         else:
             k = 20
-            idx, distance = NNDescent(cluster_adata.obsm['Concord'][:, :ndims], n_neighbors=k).neighbor_graph
-            idx = idx[:, 1:] # Drop self from sNN
-            n_cells = idx.shape[0]
-            snn = lil_matrix((n_cells, n_cells), dtype=np.float32)
-            neighbor_sets = [set(row) for row in idx]
-            for i in range(n_cells):
-                ni = neighbor_sets[i]
-                for j in idx[i]:
-                    shared = len(ni.intersection(neighbor_sets[j]))
-                    if shared > 0:
-                        snn[i, j] = shared/k
-            snn = snn.maximum(snn.T)
-            # Prune if less than 1/15th of k neighbors are shared
-            snn[snn < (1/15)] = 0
-            cluster_adata.obsp['connectivities'] = csr_matrix(snn)
+        
+        idx, distance = NNDescent(cluster_adata.obsm['Concord'][:, :ndims], n_neighbors=k).neighbor_graph
+        idx = idx[:, 1:]  # Drop self from sNN
+        n_cells = idx.shape[0]
+        
+        # Vectorized sNN calculation using sparse matrix operations
+        # Create a binary neighbor matrix
+        row_indices = np.repeat(np.arange(n_cells), k-1)
+        col_indices = idx.flatten()
+        data = np.ones(len(row_indices), dtype=np.float32)
+        neighbor_matrix = csr_matrix((data, (row_indices, col_indices)), shape=(n_cells, n_cells))
+        
+        # Compute shared neighbors: multiply neighbor matrix by its transpose
+        # This gives the count of shared neighbors
+        snn = neighbor_matrix.dot(neighbor_matrix.T)
+        
+        # Normalize by k to get the Jaccard-like similarity
+        snn = snn.multiply(1.0 / k)
+        
+        # Make symmetric (take maximum)
+        snn = snn.maximum(snn.T)
+        
+        # Prune edges with less than 1/15 similarity
+        snn.data[snn.data < (1/15)] = 0
+        snn.eliminate_zeros()
+        
+        cluster_adata.obsp['connectivities'] = snn
         # Convert sparse matrix to igraph directly to avoid scipy compatibility issues
+        print('Performing Leiden clustering...')
         sources, targets = cluster_adata.obsp['connectivities'].nonzero()
         weights = cluster_adata.obsp['connectivities'].data
         g = ig.Graph(n=cluster_adata.n_obs, edges=list(zip(sources, targets)), 
                      edge_attrs={'weight': weights}, directed=False)
-        part = leidenalg.find_partition(g, leidenalg.RBConfigurationVertexPartition, resolution_parameter=0.5)
+        part = leidenalg.find_partition(g, leidenalg.RBConfigurationVertexPartition, resolution_parameter=1)
         cluster_adata.obs['leiden'] = [str(c) for c in part.membership]
         cluster_adata.obs['leiden'] = cluster_adata.obs['leiden'].astype('category')
         
