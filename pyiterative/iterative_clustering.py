@@ -154,7 +154,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         ccd_model = ccd.Concord(adata=cluster_adata, input_feature=hvgs, domain_key=batch_key, 
                                 device=device, preload_dense=False, batch_size=batch_size, latent_dim=ndims,
-                                encoder_dims=[2**(np.floor(np.sqrt(ndims))+1)]) # Use encoder_dims = 2^(floor(sqrt(ndims))+1)
+                                encoder_dims=[int(2**(np.floor(np.sqrt(ndims))+1))]) # Use encoder_dims = 2^(floor(sqrt(ndims))+1)
         ccd_model.fit_transform(output_key='Concord')
 
         if cluster_adata.n_obs < min_cluster_size:
