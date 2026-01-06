@@ -431,7 +431,7 @@ def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes):
         min_pct=0,
         max_pval=0.05,
         min_count=10,
-        icc='i',
+        icc='A',
         df_correction=False,
         n_cores=max(1, cpu_count() - 1)
     )
