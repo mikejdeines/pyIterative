@@ -148,7 +148,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
     clusters = adata.obs['leiden'].cat.categories.copy()
     
     for cluster in clusters:
-        cluster_mask = adata.obs['leiden'] == cluster
+        cluster_mask = (adata.obs['leiden'] == cluster).values
         cluster_adata = adata[cluster_mask].copy()
         cluster_adata.layers['counts'] = cluster_adata.X.copy()
         sc.pp.normalize_total(cluster_adata, target_sum=1e4)
@@ -176,7 +176,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
         cluster_adata_hvg = cluster_adata[:, hvg_genes].copy()
         
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-        ccd_model = ccd.Concord(adata=cluster_adata_hvg, domain_key=batch_key, 
+        ccd_model = ccd.Concord(adata=cluster_adata_hvg, input_feature=hvg_genes, domain_key=batch_key, 
                                 device=device, preload_dense=False, batch_size=batch_size, latent_dim=ndims,
                                 encoder_dims=[int(2**(np.floor(np.sqrt(ndims))+1))]) # Use encoder_dims = 2^(floor(sqrt(ndims))+1)
         ccd_model.fit_transform(output_key='Concord')
@@ -677,8 +677,8 @@ def chi2_test_gpu(
         var_names = adata.var_names
     
     # Subset by identities
-    mask_1 = adata.obs[groupby] == ident_1
-    mask_2 = adata.obs[groupby] == ident_2
+    mask_1 = (adata.obs[groupby] == ident_1).values
+    mask_2 = (adata.obs[groupby] == ident_2).values
     
     Ci_1 = X[mask_1, :]
     Ci_2 = X[mask_2, :]
@@ -838,8 +838,8 @@ def chi2_test(
         var_names = adata.var_names
     
     # Subset by identities
-    mask_1 = adata.obs[groupby] == ident_1
-    mask_2 = adata.obs[groupby] == ident_2
+    mask_1 = (adata.obs[groupby] == ident_1).values
+    mask_2 = (adata.obs[groupby] == ident_2).values
     
     Ci_1 = X[mask_1, :]
     Ci_2 = X[mask_2, :]
@@ -1107,8 +1107,8 @@ def iter_wght_ttest_gpu(
         var_names = adata.var_names
     
     # Subset by identities
-    mask_1 = adata.obs[groupby] == ident_1
-    mask_2 = adata.obs[groupby] == ident_2
+    mask_1 = (adata.obs[groupby] == ident_1).values
+    mask_2 = (adata.obs[groupby] == ident_2).values
     
     Ci_1 = X[mask_1, :]
     Ci_2 = X[mask_2, :]
@@ -1323,8 +1323,8 @@ def iter_wght_ttest(
         var_names = adata.var_names
     
     # Subset by identities
-    mask_1 = adata.obs[groupby] == ident_1
-    mask_2 = adata.obs[groupby] == ident_2
+    mask_1 = (adata.obs[groupby] == ident_1).values
+    mask_2 = (adata.obs[groupby] == ident_2).values
     
     Ci_1 = X[mask_1, :]
     Ci_2 = X[mask_2, :]
@@ -1796,7 +1796,7 @@ def cnt_av(
     
     for sample in tqdm(samples):
         # Subset data for this sample
-        mask = adata.obs[sample_key] == sample
+        mask = (adata.obs[sample_key] == sample).values
         Ci = X[mask, :]
         
         # Calculate total counts per cell
