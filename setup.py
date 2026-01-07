@@ -9,7 +9,7 @@ setup(
     packages=find_packages(include=['pyiterative*']),
     install_requires=[
         'scanpy',
-        'pandas',
+        'pandas<2.0.0',
         'igraph',
         'leidenalg',
         'scvi-tools>=0.18.1',
