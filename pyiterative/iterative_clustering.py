@@ -29,7 +29,7 @@ def Iterative_Clustering(adata, ndims=30, num_iterations=20, min_pct=0.4, min_lo
         num_iterations: Maximum number of clustering iterations.
         min_pct: Minimum percentage of cells expressing a gene to consider it for differential expression.
         min_log2_fc: Minimum log2 fold change for a gene to be considered differentially expressed.
-        batch_size: Batch size for scVI differential expression.
+        batch_size: Batch size for differential expression.
         min_score: Minimum score for a gene to be considered differentially expressed.
         min_de_genes: Minimum number of differentially expressed genes required (returns score of 0 if below threshold).
         min_cluster_size: Minimum size of clusters to retain.
@@ -46,6 +46,56 @@ def Iterative_Clustering(adata, ndims=30, num_iterations=20, min_pct=0.4, min_lo
         if len(adata.obs['leiden'].cat.categories) == previous_num_clusters:
             break
         previous_num_clusters = len(adata.obs['leiden'].cat.categories)
+    
+    # Final validation: ensure all clusters have DE_score > min_score with their closest cluster
+    print('Performing final validation of cluster separation...')
+    final_validation_changes = True
+    while final_validation_changes:
+        final_validation_changes = False
+        current_clusters = adata.obs['leiden'].cat.categories.copy()
+        
+        if len(current_clusters) < 2:
+            break
+        
+        # Calculate centroids for all final clusters
+        final_centroids = Find_Centroids(adata, cluster_key='leiden', embedding_key='X_scVI', ndims=ndims)
+        
+        if final_centroids.shape[0] < 2:
+            break
+        
+        # Check each cluster against its nearest neighbor
+        for cluster in current_clusters:
+            cluster_size = np.sum(adata.obs['leiden'] == cluster)
+            
+            # Skip if cluster no longer exists (might have been merged in previous iteration)
+            if cluster_size == 0:
+                continue
+            
+            # Find nearest cluster
+            nearest_cluster = Find_Nearest_Cluster(final_centroids, current_clusters, cluster)
+            
+            if nearest_cluster is None:
+                continue
+            
+            nearest_cluster_size = np.sum(adata.obs['leiden'] == nearest_cluster)
+            
+            # Skip if nearest cluster no longer exists
+            if nearest_cluster_size == 0:
+                continue
+            
+            # Calculate DE score between cluster and its nearest neighbor
+            de_score = DE_Score(adata, cluster, nearest_cluster, min_pct, min_log2_fc, min_de_genes)
+            
+            if de_score < min_score:
+                print(f"Final validation: merging cluster {cluster} ({cluster_size} cells) with nearest cluster {nearest_cluster} ({nearest_cluster_size} cells) - DE score: {de_score:.2f}")
+                adata.obs.loc[adata.obs['leiden'] == cluster, 'leiden'] = nearest_cluster
+                final_validation_changes = True
+                break  # Start over after merge
+        
+        if final_validation_changes:
+            adata.obs['leiden'] = adata.obs['leiden'].cat.remove_unused_categories()
+    
+    print(f'Final validation complete. Final number of clusters: {len(adata.obs["leiden"].cat.categories)}')
     return adata
 
 def Find_Nearest_Cluster(centroids, cluster_labels, target_cluster):
@@ -99,7 +149,7 @@ def Find_Centroids(adata, cluster_key='leiden', embedding_key='X_scVI', ndims=30
     """
     Calculates centroids in the scVI latent space for each cluster in adata.
     Args:
-        adata: AnnData object containing the scRNA-seq data with obsm['X_scVI'].
+        adata: AnnData object containing the scRNA-seq data
         cluster_key: Key in adata.obs indicating cluster assignments.
         embedding_key: Key in adata.obsm indicating the embedding to use (e.g., 'X_scVI').
         ndims: Number of dimensions in the embedding to consider.
