@@ -174,8 +174,8 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
             continue
         
         # Check cluster size BEFORE attempting to fit Concord model
-        if cluster_adata.n_obs < min_cluster_size:
-            print(f"Warning: Cluster {cluster} has {cluster_adata.n_obs} cells (< {min_cluster_size}), skipping")
+        if cluster_adata.n_obs <= min_cluster_size:
+            print(f"Warning: Cluster {cluster} has {cluster_adata.n_obs} cells (=< {min_cluster_size}), skipping")
             continue
             
         cluster_adata_hvg = cluster_adata[:, hvg_genes].copy()
@@ -187,7 +187,12 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
         ccd_model = ccd.Concord(adata=cluster_adata_hvg, input_feature=hvg_genes, domain_key=batch_key, 
                                 device=device, preload_dense=False, batch_size=effective_batch_size, latent_dim=ndims,
                                 encoder_dims=[int(2**(np.floor(np.sqrt(ndims))+1))]) # Use encoder_dims = 2^(floor(sqrt(ndims))+1)
-        ccd_model.fit_transform(output_key='Concord')
+        
+        try:
+            ccd_model.fit_transform(output_key='Concord')
+        except Exception as e:
+            print(f"Warning: Concord fit_transform failed for cluster {cluster} ({str(e)}), skipping")
+            continue
         
         # Transfer the Concord embedding back to the original cluster_adata
         cluster_adata.obsm['Concord'] = cluster_adata_hvg.obsm['Concord']
