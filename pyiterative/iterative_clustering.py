@@ -172,20 +172,25 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
         if len(hvg_genes) == 0:
             print(f"Warning: No highly variable genes found for cluster {cluster}, skipping")
             continue
+        
+        # Check cluster size BEFORE attempting to fit Concord model
+        if cluster_adata.n_obs < min_cluster_size:
+            print(f"Warning: Cluster {cluster} has {cluster_adata.n_obs} cells (< {min_cluster_size}), skipping")
+            continue
             
         cluster_adata_hvg = cluster_adata[:, hvg_genes].copy()
         
+        # Adjust batch_size if it's larger than the number of observations
+        effective_batch_size = min(batch_size, cluster_adata_hvg.n_obs)
+        
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         ccd_model = ccd.Concord(adata=cluster_adata_hvg, input_feature=hvg_genes, domain_key=batch_key, 
-                                device=device, preload_dense=False, batch_size=batch_size, latent_dim=ndims,
+                                device=device, preload_dense=False, batch_size=effective_batch_size, latent_dim=ndims,
                                 encoder_dims=[int(2**(np.floor(np.sqrt(ndims))+1))]) # Use encoder_dims = 2^(floor(sqrt(ndims))+1)
         ccd_model.fit_transform(output_key='Concord')
         
         # Transfer the Concord embedding back to the original cluster_adata
         cluster_adata.obsm['Concord'] = cluster_adata_hvg.obsm['Concord']
-
-        if cluster_adata.n_obs < min_cluster_size:
-            continue
         print('Creating sNN graph...')
         if cluster_adata.n_obs < 20:
             k = int(np.floor(cluster_adata.n_obs/2))
