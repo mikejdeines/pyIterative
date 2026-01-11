@@ -239,7 +239,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
                                 encoder_dims=[int(2**(np.floor(np.sqrt(ndims))+1))]) # Use encoder_dims = 2^(floor(sqrt(ndims))+1)
         
         try:
-            ccd_model.fit_transform(output_key='Concord')
+            ccd_model.fit_transform(output_key='Concord', save_model=False)
         except Exception as e:
             print(f"Warning: Concord fit_transform failed for cluster {cluster} ({str(e)}), skipping")
             continue
