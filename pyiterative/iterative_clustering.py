@@ -57,8 +57,11 @@ def Iterative_Clustering(adata, ndims=30, num_iterations=20, min_pct=0.4, min_lo
         if len(current_clusters) < 2:
             break
         
-        # Calculate centroids for all final clusters
-        final_centroids = Find_Centroids(adata, cluster_key='leiden', embedding_key='X_scVI', ndims=ndims)
+        # Calculate centroids for all final clusters in PCA space
+        sc.pp.highly_variable_genes(adata, n_top_genes=2000, subset=False, flavor='seurat_v3', layer='counts', span=0.5)
+        sc.pp.scale(adata, max_value=10)
+        sc.pp.pca(adata, n_comps=ndims, use_highly_variable=True, svd_solver='arpack')
+        final_centroids = Find_Centroids(adata, cluster_key='leiden', embedding_key='X_pca', ndims=ndims)
         
         if final_centroids.shape[0] < 2:
             break
@@ -189,8 +192,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
          min_score: Minimum score for a gene to be considered differentially expressed.
          min_de_genes: Minimum number of differentially expressed genes required (returns score of 0 if below threshold).
          min_cluster_size: Minimum size of clusters to retain.
-         model: scVI model object for differential expression analysis. If None, clustering will still occur but differential expression scoring will be skipped.
-         embedding_key: Key in adata.obsm indicating the embedding to use (default: 'X_scVI').
+         batch_key: Key in adata.obs indicating batch information for CONCORD model.
     Returns:
          adata: AnnData object with updated clustering in adata.obs['leiden'].
     """
