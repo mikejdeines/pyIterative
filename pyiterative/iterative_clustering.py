@@ -58,6 +58,7 @@ def Iterative_Clustering(adata, ndims=30, num_iterations=20, min_pct=0.4, min_lo
             break
         
         # Calculate centroids for all final clusters in PCA space
+        adata.layers['counts'] = adata.X.copy()
         sc.pp.highly_variable_genes(adata, n_top_genes=2000, subset=False, flavor='seurat_v3', layer='counts', span=0.5)
         sc.pp.scale(adata, max_value=10)
         sc.pp.pca(adata, n_comps=ndims, use_highly_variable=True, svd_solver='arpack')
