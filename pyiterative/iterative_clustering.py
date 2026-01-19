@@ -59,7 +59,18 @@ def Iterative_Clustering(adata, ndims=30, num_iterations=20, min_pct=0.4, min_lo
         
         # Calculate centroids for all final clusters in PCA space
         adata.layers['counts'] = adata.X.copy()
-        sc.pp.highly_variable_genes(adata, n_top_genes=2000, subset=False, flavor='seurat_v3', layer='counts', span=0.5)
+        try:
+            sc.pp.highly_variable_genes(adata, n_top_genes=2000, subset=False, flavor='seurat_v3', layer='counts', span=0.5)
+        except ValueError as e:
+            if 'Extrapolation not allowed' in str(e):
+                # Fallback: use larger span or different method
+                try:
+                    sc.pp.highly_variable_genes(adata, n_top_genes=2000, subset=False, flavor='seurat_v3', layer='counts', span=1.0)
+                except:
+                    # Final fallback: use seurat method
+                    sc.pp.highly_variable_genes(adata, n_top_genes=2000, subset=False, flavor='seurat', layer='counts')
+            else:
+                raise
         sc.pp.scale(adata, max_value=10)
         sc.pp.pca(adata, n_comps=ndims, use_highly_variable=True, svd_solver='arpack')
         final_centroids = Find_Centroids(adata, cluster_key='leiden', embedding_key='X_pca', ndims=ndims)
@@ -214,9 +225,16 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
             sc.pp.highly_variable_genes(cluster_adata, n_top_genes=n_genes, subset=False, flavor='seurat_v3', layer='counts',
                                         span=0.5)
         except (ValueError, RuntimeError) as e:
-            # If seurat_v3 fails (e.g., LOESS singularities), run with 'seurat' flavor
-            print(f"Warning: seurat_v3 HVG failed for cluster {cluster} ({str(e)}), running seurat flavor instead")
-            sc.pp.highly_variable_genes(cluster_adata, n_top_genes=n_genes, subset=False, flavor='seurat')
+            # If seurat_v3 fails (e.g., LOESS singularities or extrapolation error), try larger span first
+            if 'Extrapolation not allowed' in str(e):
+                try:
+                    sc.pp.highly_variable_genes(cluster_adata, n_top_genes=n_genes, subset=False, flavor='seurat_v3', layer='counts', span=1.0)
+                except:
+                    print(f"Warning: seurat_v3 HVG failed for cluster {cluster} ({str(e)}), using seurat flavor instead")
+                    sc.pp.highly_variable_genes(cluster_adata, n_top_genes=n_genes, subset=False, flavor='seurat')
+            else:
+                print(f"Warning: seurat_v3 HVG failed for cluster {cluster} ({str(e)}), using seurat flavor instead")
+                sc.pp.highly_variable_genes(cluster_adata, n_top_genes=n_genes, subset=False, flavor='seurat')
         
         # Subset to highly variable genes for Concord
         hvg_genes = cluster_adata.var_names[cluster_adata.var['highly_variable']].tolist()
