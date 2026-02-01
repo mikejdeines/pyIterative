@@ -9,7 +9,7 @@ from statsmodels.stats.multitest import multipletests
 from tqdm import tqdm
 from typing import Optional, Union, List, Dict
 from multiprocessing import cpu_count
-from concurrent.futures import ProcessPoolExecutor
+from joblib import Parallel, delayed
 from functools import partial
 from pynndescent import NNDescent
 from scipy.sparse import csr_matrix
@@ -20,28 +20,6 @@ import torch
 # Check for GPU availability
 _GPU_AVAILABLE = torch.cuda.is_available()
 _DEVICE = torch.device('cuda' if _GPU_AVAILABLE else 'cpu')
-
-# Global executor pool for efficient reuse (lazily initialized)
-_EXECUTOR_POOL = None
-_EXECUTOR_WORKERS = None
-
-def _get_executor(n_cores):
-    """Get or create a global ProcessPoolExecutor for reuse."""
-    global _EXECUTOR_POOL, _EXECUTOR_WORKERS
-    
-    # Only create pool if n_cores > 1 and different from current
-    if n_cores <= 1:
-        return None
-    
-    if _EXECUTOR_POOL is None or _EXECUTOR_WORKERS != n_cores:
-        # Clean up old pool if exists
-        if _EXECUTOR_POOL is not None:
-            _EXECUTOR_POOL.shutdown(wait=False)
-        
-        _EXECUTOR_POOL = ProcessPoolExecutor(max_workers=n_cores)
-        _EXECUTOR_WORKERS = n_cores
-    
-    return _EXECUTOR_POOL
 
 def Iterative_Clustering(adata, ndims=30, num_iterations=20, min_pct=0.4, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=1, min_cluster_size=4, batch_key=None, n_cores=None):
     """
@@ -1030,8 +1008,9 @@ def chi2_test(
     print("Performing chi^2 test:")
     
     if n_cores > 1:
-        with ProcessPoolExecutor(max_workers=n_cores) as executor:
-            results = list(tqdm(executor.map(process_gene, valid_genes), total=len(valid_genes)))
+        results = Parallel(n_jobs=n_cores, backend='loky')(
+            delayed(process_gene)(gene_args) for gene_args in tqdm(valid_genes)
+        )
     else:
         results = [process_gene(args) for args in tqdm(valid_genes)]
     
@@ -1492,8 +1471,9 @@ def iter_wght_ttest(
                  for gene, idx in valid_genes]
     
     if n_cores > 1:
-        with ProcessPoolExecutor(max_workers=n_cores) as executor:
-            results = list(tqdm(executor.map(_process_gene_weighted_ttest, args_list), total=len(valid_genes)))
+        results = Parallel(n_jobs=n_cores, backend='loky')(
+            delayed(_process_gene_weighted_ttest)(args) for args in tqdm(args_list)
+        )
     else:
         results = [_process_gene_weighted_ttest(args) for args in tqdm(args_list)]
     
@@ -1702,7 +1682,10 @@ def icc_iter(h: np.ndarray, n: np.ndarray) -> float:
 
 def compute_icc_weights_parallel(h_list, n, icc, n_cores=1):
     """
-    Compute ICC weights for multiple genes in parallel.
+    Compute ICC weights for multiple genes in parallel using joblib.
+    
+    joblib uses memory mapping for efficient numpy array serialization,
+    avoiding the expensive pickling overhead of standard multiprocessing.
     
     Parameters
     ----------
@@ -1714,7 +1697,7 @@ def compute_icc_weights_parallel(h_list, n, icc, n_cores=1):
         ICC method: 'i' (iterative), 'A' (ANOVA), 0, or 1
     n_cores : int
         Number of cores to use for parallel processing. Default is 1.
-        If n_cores > 1, uses multiprocessing for parallel computation.
+        If n_cores > 1, uses joblib for parallel computation.
         
     Returns
     -------
@@ -1722,25 +1705,17 @@ def compute_icc_weights_parallel(h_list, n, icc, n_cores=1):
         List of weight arrays, one per gene
     """
     # Only use parallel processing if worth the overhead
-    # Executor creation has significant overhead, so only parallelize for larger workloads
-    if n_cores <= 1 or len(h_list) < 50:
+    if n_cores <= 1 or len(h_list) < 20:
         # Sequential processing for single core or small workloads
         return [icc_weight(h, n, icc) for h in h_list]
     
-    # Get global executor pool for reuse (much more efficient than creating new ones)
-    executor = _get_executor(n_cores)
-    if executor is None:
-        return [icc_weight(h, n, icc) for h in h_list]
+    # joblib with loky backend has efficient numpy serialization via memory mapping
+    # batch_size controls how many tasks are sent to each worker (reduces overhead)
+    batch_size = max(1, len(h_list) // (n_cores * 4))
     
-    # Create a partial function with fixed n and icc
-    icc_weight_fixed = partial(icc_weight, n=n, icc=icc)
-    
-    # Use chunksize to reduce overhead
-    # chunksize determines how many items are sent to each worker at once
-    chunksize = max(1, len(h_list) // (n_cores * 4))
-    
-    # Use global executor (no context manager needed - it persists)
-    results = list(executor.map(icc_weight_fixed, h_list, chunksize=chunksize))
+    results = Parallel(n_jobs=n_cores, backend='loky', batch_size=batch_size)(
+        delayed(icc_weight)(h, n, icc) for h in h_list
+    )
     
     return results
 
