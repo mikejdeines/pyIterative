@@ -8,7 +8,8 @@ from scipy.optimize import brentq
 from statsmodels.stats.multitest import multipletests
 from tqdm import tqdm
 from typing import Optional, Union, List, Dict
-from multiprocessing import Pool, cpu_count
+from multiprocessing import cpu_count
+from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from pynndescent import NNDescent
 from scipy.sparse import csr_matrix
@@ -19,6 +20,29 @@ import torch
 # Check for GPU availability
 _GPU_AVAILABLE = torch.cuda.is_available()
 _DEVICE = torch.device('cuda' if _GPU_AVAILABLE else 'cpu')
+
+# Global executor pool for efficient reuse (lazily initialized)
+_EXECUTOR_POOL = None
+_EXECUTOR_WORKERS = None
+
+def _get_executor(n_cores):
+    """Get or create a global ProcessPoolExecutor for reuse."""
+    global _EXECUTOR_POOL, _EXECUTOR_WORKERS
+    
+    # Only create pool if n_cores > 1 and different from current
+    if n_cores <= 1:
+        return None
+    
+    if _EXECUTOR_POOL is None or _EXECUTOR_WORKERS != n_cores:
+        # Clean up old pool if exists
+        if _EXECUTOR_POOL is not None:
+            _EXECUTOR_POOL.shutdown(wait=False)
+        
+        _EXECUTOR_POOL = ProcessPoolExecutor(max_workers=n_cores)
+        _EXECUTOR_WORKERS = n_cores
+    
+    return _EXECUTOR_POOL
+
 def Iterative_Clustering(adata, ndims=30, num_iterations=20, min_pct=0.4, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=1, min_cluster_size=4, batch_key=None, n_cores=None):
     """
     Wrapper function to perform iterative clustering using scVI and Leiden algorithm.
@@ -1006,8 +1030,8 @@ def chi2_test(
     print("Performing chi^2 test:")
     
     if n_cores > 1:
-        with Pool(n_cores) as pool:
-            results = list(tqdm(pool.imap(process_gene, valid_genes), total=len(valid_genes)))
+        with ProcessPoolExecutor(max_workers=n_cores) as executor:
+            results = list(tqdm(executor.map(process_gene, valid_genes), total=len(valid_genes)))
     else:
         results = [process_gene(args) for args in tqdm(valid_genes)]
     
@@ -1468,8 +1492,8 @@ def iter_wght_ttest(
                  for gene, idx in valid_genes]
     
     if n_cores > 1:
-        with Pool(n_cores) as pool:
-            results = list(tqdm(pool.imap(_process_gene_weighted_ttest, args_list), total=len(valid_genes)))
+        with ProcessPoolExecutor(max_workers=n_cores) as executor:
+            results = list(tqdm(executor.map(_process_gene_weighted_ttest, args_list), total=len(valid_genes)))
     else:
         results = [_process_gene_weighted_ttest(args) for args in tqdm(args_list)]
     
@@ -1697,17 +1721,26 @@ def compute_icc_weights_parallel(h_list, n, icc, n_cores=1):
     list of arrays
         List of weight arrays, one per gene
     """
-    if n_cores <= 1 or len(h_list) < 2:
+    # Only use parallel processing if worth the overhead
+    # Executor creation has significant overhead, so only parallelize for larger workloads
+    if n_cores <= 1 or len(h_list) < 50:
         # Sequential processing for single core or small workloads
         return [icc_weight(h, n, icc) for h in h_list]
     
-    # Parallel processing with multiprocessing
+    # Get global executor pool for reuse (much more efficient than creating new ones)
+    executor = _get_executor(n_cores)
+    if executor is None:
+        return [icc_weight(h, n, icc) for h in h_list]
+    
     # Create a partial function with fixed n and icc
     icc_weight_fixed = partial(icc_weight, n=n, icc=icc)
     
-    # Use multiprocessing Pool for parallel computation
-    with Pool(processes=n_cores) as pool:
-        results = pool.map(icc_weight_fixed, h_list)
+    # Use chunksize to reduce overhead
+    # chunksize determines how many items are sent to each worker at once
+    chunksize = max(1, len(h_list) // (n_cores * 4))
+    
+    # Use global executor (no context manager needed - it persists)
+    results = list(executor.map(icc_weight_fixed, h_list, chunksize=chunksize))
     
     return results
 
