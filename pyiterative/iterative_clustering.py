@@ -7,12 +7,10 @@ from scipy import stats
 from scipy.optimize import brentq
 from statsmodels.stats.multitest import multipletests
 from tqdm import tqdm
-from typing import Optional, Union, List, Tuple, Dict
-import warnings
+from typing import Optional, Union, List, Dict
 from multiprocessing import Pool, cpu_count
-import logging
 from pynndescent import NNDescent
-from scipy.sparse import lil_matrix, csr_matrix
+from scipy.sparse import csr_matrix
 import igraph as ig
 import concord as ccd
 import torch
@@ -33,8 +31,7 @@ def Iterative_Clustering(adata, ndims=30, num_iterations=20, min_pct=0.4, min_lo
         min_score: Minimum score for a gene to be considered differentially expressed.
         min_de_genes: Minimum number of differentially expressed genes required (returns score of 0 if below threshold).
         min_cluster_size: Minimum size of clusters to retain.
-        model: scVI model object for differential expression analysis.
-        embedding_key: Key in adata.obsm indicating the embedding to use (default: 'X_scVI').
+        batch_key: Key in adata.obs indicating batch information for CONCORD model.
     Returns:
         adata: AnnData object with updated clustering in adata.obs['leiden'].
     """
@@ -71,9 +68,13 @@ def Iterative_Clustering(adata, ndims=30, num_iterations=20, min_pct=0.4, min_lo
                     sc.pp.highly_variable_genes(adata, n_top_genes=2000, subset=False, flavor='seurat', layer='counts')
             else:
                 raise
-        sc.pp.scale(adata, max_value=10)
-        sc.pp.pca(adata, n_comps=ndims, use_highly_variable=True, svd_solver='arpack')
-        final_centroids = Find_Centroids(adata, cluster_key='leiden', embedding_key='X_pca', ndims=ndims)
+        hvg_genes = adata.var_names[adata.var['highly_variable']].tolist()
+        adata_hvg = adata[:, hvg_genes].copy()
+        ccd_model = ccd.Concord(adata=adata_hvg, input_feature=hvg_genes, domain_key=batch_key, 
+                                device=_DEVICE, preload_dense=False, batch_size=batch_size, latent_dim=ndims,
+                                encoder_dims=[int(2**(np.floor(np.sqrt(ndims))+1))], save_dir=None)
+        ccd_model.fit_transform(output_key='Concord', save_model=False)
+        final_centroids = Find_Centroids(adata_hvg, cluster_key='leiden', embedding_key='Concord', ndims=ndims)
         
         if final_centroids.shape[0] < 2:
             break
@@ -256,7 +257,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
         
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         ccd_model = ccd.Concord(adata=cluster_adata_hvg, input_feature=hvg_genes, domain_key=batch_key, 
-                                device=device, preload_dense=False, batch_size=effective_batch_size, latent_dim=ndims,
+                                device=_DEVICE, preload_dense=False, batch_size=effective_batch_size, latent_dim=ndims,
                                 encoder_dims=[int(2**(np.floor(np.sqrt(ndims))+1))], save_dir=None) # Use encoder_dims = 2^(floor(sqrt(ndims))+1)
         
         try:
