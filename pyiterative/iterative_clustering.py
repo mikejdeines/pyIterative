@@ -9,6 +9,7 @@ from statsmodels.stats.multitest import multipletests
 from tqdm import tqdm
 from typing import Optional, Union, List, Dict
 from multiprocessing import Pool, cpu_count
+from functools import partial
 from pynndescent import NNDescent
 from scipy.sparse import csr_matrix
 import igraph as ig
@@ -18,7 +19,7 @@ import torch
 # Check for GPU availability
 _GPU_AVAILABLE = torch.cuda.is_available()
 _DEVICE = torch.device('cuda' if _GPU_AVAILABLE else 'cpu')
-def Iterative_Clustering(adata, ndims=30, num_iterations=20, min_pct=0.4, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=1, min_cluster_size=4, batch_key=None):
+def Iterative_Clustering(adata, ndims=30, num_iterations=20, min_pct=0.4, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=1, min_cluster_size=4, batch_key=None, n_cores=None):
     """
     Wrapper function to perform iterative clustering using scVI and Leiden algorithm.
     Args:
@@ -32,14 +33,18 @@ def Iterative_Clustering(adata, ndims=30, num_iterations=20, min_pct=0.4, min_lo
         min_de_genes: Minimum number of differentially expressed genes required (returns score of 0 if below threshold).
         min_cluster_size: Minimum size of clusters to retain.
         batch_key: Key in adata.obs indicating batch information for CONCORD model.
+        n_cores: Number of CPU cores to use for parallel processing. Default is max(1, cpu_count() - 1).
     Returns:
         adata: AnnData object with updated clustering in adata.obs['leiden'].
     """
+    if n_cores is None:
+        n_cores = max(1, cpu_count() - 1)
+    
     adata.obs['leiden']='1'
     adata.obs['leiden'] = adata.obs['leiden'].astype('category')
     previous_num_clusters = 1
     for i in range(num_iterations):
-        adata = Clustering_Iteration(adata, ndims=ndims, min_pct=min_pct, min_log2_fc=min_log2_fc, batch_size=batch_size, min_score=min_score, min_de_genes=min_de_genes, min_cluster_size=min_cluster_size, batch_key=batch_key)
+        adata = Clustering_Iteration(adata, ndims=ndims, min_pct=min_pct, min_log2_fc=min_log2_fc, batch_size=batch_size, min_score=min_score, min_de_genes=min_de_genes, min_cluster_size=min_cluster_size, batch_key=batch_key, n_cores=n_cores)
         if len(adata.obs['leiden'].cat.categories) == previous_num_clusters:
             break
         previous_num_clusters = len(adata.obs['leiden'].cat.categories)
@@ -100,7 +105,7 @@ def Iterative_Clustering(adata, ndims=30, num_iterations=20, min_pct=0.4, min_lo
                 continue
             
             # Calculate DE score between cluster and its nearest neighbor
-            de_score = DE_Score(adata, cluster, nearest_cluster, min_pct, min_log2_fc, min_de_genes)
+            de_score = DE_Score(adata, cluster, nearest_cluster, min_pct, min_log2_fc, min_de_genes, n_cores=n_cores)
             
             if de_score < min_score:
                 print(f"Final validation: merging cluster {cluster} ({cluster_size} cells) with nearest cluster {nearest_cluster} ({nearest_cluster_size} cells) - DE score: {de_score:.2f}")
@@ -193,7 +198,7 @@ def Find_Centroids(adata, cluster_key='leiden', embedding_key='X_scVI', ndims=30
         centroids_df = centroids_df.dropna()
         
     return centroids_df.values
-def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=1, min_cluster_size=4, batch_key=None):
+def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=1, min_cluster_size=4, batch_key=None, n_cores=None):
     """
     Performs one iteration of clustering and merging.
     Args:
@@ -206,9 +211,12 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
          min_de_genes: Minimum number of differentially expressed genes required (returns score of 0 if below threshold).
          min_cluster_size: Minimum size of clusters to retain.
          batch_key: Key in adata.obs indicating batch information for CONCORD model.
+         n_cores: Number of CPU cores to use for parallel processing. Default is max(1, cpu_count() - 1).
     Returns:
          adata: AnnData object with updated clustering in adata.obs['leiden'].
     """
+    if n_cores is None:
+        n_cores = max(1, cpu_count() - 1)
     
     clusters = adata.obs['leiden'].cat.categories.copy()
     
@@ -406,7 +414,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
                     continue
                     
                 # Perform differential expression analysis for larger clusters
-                bayes_de_score = DE_Score(cluster_adata, sub_cluster, closest_sub_cluster, min_pct, min_log2_fc, min_de_genes)
+                bayes_de_score = DE_Score(cluster_adata, sub_cluster, closest_sub_cluster, min_pct, min_log2_fc, min_de_genes, n_cores=n_cores)
                 
                 if bayes_de_score < min_score:
                     cluster_adata.obs.loc[cluster_adata.obs['leiden'] == closest_sub_cluster, 'leiden'] = sub_cluster
@@ -531,7 +539,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
     adata.obs['leiden'] = adata.obs['leiden'].cat.remove_unused_categories()
     print('Clustering iteration complete. Number of clusters:', len(adata.obs['leiden'].cat.categories))
     return adata
-def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes, DE_batch_size=2048):
+def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes, DE_batch_size=2048, n_cores=None):
     """
     Calculate differential expression score between two identities.
     Args:
@@ -542,9 +550,13 @@ def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes, DE_bat
         min_log2_fc: Minimum log2 fold change for a gene to be considered differentially expressed.
         min_de_genes: Minimum number of differentially expressed genes required (returns score of 0 if below threshold).
         DE_batch_size: Batch size for GPU processing in dge_2samples (default: 2048).
+        n_cores: Number of CPU cores to use for parallel processing. Default is max(1, cpu_count() - 1).
     Returns:
         de_score: Differential expression score sum(min(-log10(p),20)).
     """
+    if n_cores is None:
+        n_cores = max(1, cpu_count() - 1)
+    
     de_results = dge_2samples(
         adata,
         ident_1=ident_1,
@@ -556,7 +568,7 @@ def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes, DE_bat
         min_count=10,
         icc='i',
         df_correction=False,
-        n_cores=max(1, cpu_count() - 1),
+        n_cores=n_cores,
         gpu_batch_size=DE_batch_size
     )
     
@@ -1666,7 +1678,7 @@ def icc_iter(h: np.ndarray, n: np.ndarray) -> float:
 
 def compute_icc_weights_parallel(h_list, n, icc, n_cores=1):
     """
-    Compute ICC weights for multiple genes sequentially.
+    Compute ICC weights for multiple genes in parallel.
     
     Parameters
     ----------
@@ -1677,15 +1689,27 @@ def compute_icc_weights_parallel(h_list, n, icc, n_cores=1):
     icc : str or float
         ICC method: 'i' (iterative), 'A' (ANOVA), 0, or 1
     n_cores : int
-        Unused parameter (kept for backward compatibility)
+        Number of cores to use for parallel processing. Default is 1.
+        If n_cores > 1, uses multiprocessing for parallel computation.
         
     Returns
     -------
     list of arrays
         List of weight arrays, one per gene
     """
-    # Sequential processing (parallelization removed for performance)
-    return [icc_weight(h, n, icc) for h in h_list]
+    if n_cores <= 1 or len(h_list) < 2:
+        # Sequential processing for single core or small workloads
+        return [icc_weight(h, n, icc) for h in h_list]
+    
+    # Parallel processing with multiprocessing
+    # Create a partial function with fixed n and icc
+    icc_weight_fixed = partial(icc_weight, n=n, icc=icc)
+    
+    # Use multiprocessing Pool for parallel computation
+    with Pool(processes=n_cores) as pool:
+        results = pool.map(icc_weight_fixed, h_list)
+    
+    return results
 
 
 def icc_weight(h: np.ndarray, n: np.ndarray, icc: Union[str, float] = 'i') -> np.ndarray:
