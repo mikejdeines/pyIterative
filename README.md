@@ -28,5 +28,5 @@ Clustering iterations are performed until no new clusters are found.
 After the final iteration, all clusters are checked to make sure they are seperable by DE score.
 
 If you find this package useful, please cite the following papers:
-Margolin, G. et al. 2025.10.20.683496 (2025)
+Margolin, G. et al. Cell Reports Methods 0, (2026)
 Zhu, Q. et al. Nat Biotechnol 1–15 (2026)

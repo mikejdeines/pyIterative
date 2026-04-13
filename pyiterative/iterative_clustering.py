@@ -4,49 +4,68 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 from scipy import stats
-from scipy.optimize import brentq
+from scipy.optimize import brenth
 from statsmodels.stats.multitest import multipletests
 from tqdm import tqdm
-from typing import Optional, Union, List, Dict
 from multiprocessing import cpu_count
 from joblib import Parallel, delayed
-from functools import partial
+from sklearn.metrics import pairwise_distances
 from pynndescent import NNDescent
 from scipy.sparse import csr_matrix
 import igraph as ig
 import concord as ccd
 import torch
+import cupy as cp
+
 
 # Check for GPU availability
 _GPU_AVAILABLE = torch.cuda.is_available()
 _DEVICE = torch.device('cuda' if _GPU_AVAILABLE else 'cpu')
 
-def Iterative_Clustering(adata, ndims=30, num_iterations=20, min_pct=0.4, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=1, min_cluster_size=4, batch_key=None, n_cores=None):
+# Try to import CuPy for GPU acceleration
+try:
+    _CUPY_AVAILABLE = cp.cuda.is_available()
+    if _CUPY_AVAILABLE:
+        # Enable pinned memory for faster CPU-GPU transfers
+        cp.cuda.set_allocator(cp.cuda.MemoryPool(cp.cuda.malloc_managed).malloc)
+        # Cache for persistent GPU data
+        _GPU_CACHE = {'n_array': None, 'n_hash': None}
+except ImportError:
+    cp = None
+    _CUPY_AVAILABLE = False
+    _GPU_CACHE = {}
+
+def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=4, min_cluster_size=4, batch_key=None, n_cores=None, DE_batch_size=2048, icc_gpu=False, min_pval=0.05, pct_diff=0.7):
     """
     Wrapper function to perform iterative clustering using scVI and Leiden algorithm.
     Args:
         adata: AnnData object containing the scRNA-seq data with the specified embedding in obsm.
-        ndims: Number of latent dimensions to use from the embedding.
-        num_iterations: Maximum number of clustering iterations.
-        min_pct: Minimum percentage of cells expressing a gene to consider it for differential expression.
-        min_log2_fc: Minimum log2 fold change for a gene to be considered differentially expressed.
-        batch_size: Batch size for differential expression.
-        min_score: Minimum score for a gene to be considered differentially expressed.
-        min_de_genes: Minimum number of differentially expressed genes required (returns score of 0 if below threshold).
-        min_cluster_size: Minimum size of clusters to retain.
+        ndims: Number of latent dimensions to use from the embedding (default: 64).
+        num_iterations: Maximum number of clustering iterations (default: 20).
+        min_pct: Minimum percentage of cells expressing a gene to consider it for differential expression (default: 0.5).
+        min_log2_fc: Minimum log2 fold change for a gene to be considered differentially expressed (default: 2).
+        batch_size: Batch size for the CONCORD model (default: 256).
+        min_score: Minimum score for a gene to be considered differentially expressed (default: 150).
+        min_de_genes: Minimum number of differentially expressed genes required (returns score of 0 if below threshold) (default: 4).
+        min_cluster_size: Minimum size of clusters to retain (default: 4).
         batch_key: Key in adata.obs indicating batch information for CONCORD model.
-        n_cores: Number of CPU cores to use for parallel processing. Default is max(1, cpu_count() - 1).
+        n_cores: Number of CPU cores to use for parallel processing (default: max(1, cpu_count() - 1)).
+        DE_batch_size: Batch size for GPU processing in dge_2samples (default: 2048).
+        icc_gpu: Use GPU for ICC weight computation in dge_2samples (default: False). Set to False to force CPU.
+        min_pval: Minimum BH-adjusted p-value for a gene to be considered differentially expressed (default: 0.05).
+        pct_diff: Minimum percentage difference threshold for DE genes. If pct_1 > pct_2: pct_diff = (pct_1-pct_2)/pct_1. If pct_2 > pct_1: pct_diff = (pct_2-pct_1)/pct_2 (default: 0.7).
     Returns:
         adata: AnnData object with updated clustering in adata.obs['leiden'].
     """
     if n_cores is None:
         n_cores = max(1, cpu_count() - 1)
-    
+    # Place all cells in a single initial cluster
     adata.obs['leiden']='1'
     adata.obs['leiden'] = adata.obs['leiden'].astype('category')
     previous_num_clusters = 1
+    # Iterative loop
     for i in range(num_iterations):
-        adata = Clustering_Iteration(adata, ndims=ndims, min_pct=min_pct, min_log2_fc=min_log2_fc, batch_size=batch_size, min_score=min_score, min_de_genes=min_de_genes, min_cluster_size=min_cluster_size, batch_key=batch_key, n_cores=n_cores)
+        adata = Clustering_Iteration(adata, ndims=ndims, min_pct=min_pct, min_log2_fc=min_log2_fc, batch_size=batch_size, min_score=min_score, min_de_genes=min_de_genes, min_cluster_size=min_cluster_size, batch_key=batch_key, n_cores=n_cores, DE_batch_size=DE_batch_size, icc_gpu=icc_gpu, min_pval=min_pval, pct_diff=pct_diff)
         if len(adata.obs['leiden'].cat.categories) == previous_num_clusters:
             break
         previous_num_clusters = len(adata.obs['leiden'].cat.categories)
@@ -61,8 +80,11 @@ def Iterative_Clustering(adata, ndims=30, num_iterations=20, min_pct=0.4, min_lo
         if len(current_clusters) < 2:
             break
         
-        # Calculate centroids for all final clusters in PCA space
+        # Calculate centroids for all final clusters in CONCORD space
         adata.layers['counts'] = adata.X.copy()
+        adata.raw = adata.copy()  # Ensure .raw is populated for DE analysis
+        sc.pp.normalize_total(adata, target_sum=1e4)
+        sc.pp.log1p(adata)
         try:
             sc.pp.highly_variable_genes(adata, n_top_genes=2000, subset=False, flavor='seurat_v3', layer='counts', span=0.5)
         except ValueError as e:
@@ -107,13 +129,14 @@ def Iterative_Clustering(adata, ndims=30, num_iterations=20, min_pct=0.4, min_lo
                 continue
             
             # Calculate DE score between cluster and its nearest neighbor
-            de_score = DE_Score(adata, cluster, nearest_cluster, min_pct, min_log2_fc, min_de_genes, n_cores=n_cores)
+            de_score = DE_Score(adata, cluster, nearest_cluster, min_pct, min_log2_fc, min_de_genes, DE_batch_size=DE_batch_size, n_cores=n_cores, icc_gpu=icc_gpu, min_pval=min_pval, pct_diff=pct_diff)
             
             if de_score < min_score:
                 print(f"Final validation: merging cluster {cluster} ({cluster_size} cells) with nearest cluster {nearest_cluster} ({nearest_cluster_size} cells) - DE score: {de_score:.2f}")
                 adata.obs.loc[adata.obs['leiden'] == cluster, 'leiden'] = nearest_cluster
                 final_validation_changes = True
-                break  # Start over after merge
+                # Start over after a merge
+                break
         
         if final_validation_changes:
             adata.obs['leiden'] = adata.obs['leiden'].cat.remove_unused_categories()
@@ -130,9 +153,7 @@ def Find_Nearest_Cluster(centroids, cluster_labels, target_cluster):
         target_cluster: The cluster to find the nearest neighbor for
     Returns:
         nearest_cluster: The label of the nearest cluster, or None if no suitable cluster found
-    """
-    from sklearn.metrics import pairwise_distances
-    
+    """    
     # Get all clusters except the target cluster
     other_clusters = [c for c in cluster_labels if c != target_cluster]
     
@@ -168,13 +189,13 @@ def Find_Nearest_Cluster(centroids, cluster_labels, target_cluster):
         print(f"Error finding nearest cluster for {target_cluster}: {e}")
         # Fallback: return the first available cluster
         return other_clusters[0] if other_clusters else None
-def Find_Centroids(adata, cluster_key='leiden', embedding_key='X_scVI', ndims=30):
+def Find_Centroids(adata, cluster_key='leiden', embedding_key='Concord', ndims=30):
     """
     Calculates centroids in the scVI latent space for each cluster in adata.
     Args:
         adata: AnnData object containing the scRNA-seq data
         cluster_key: Key in adata.obs indicating cluster assignments.
-        embedding_key: Key in adata.obsm indicating the embedding to use (e.g., 'X_scVI').
+        embedding_key: Key in adata.obsm indicating the embedding to use (e.g., 'Concord').
         ndims: Number of dimensions in the embedding to consider.
     Returns:
         Value array of shape (num_clusters, ndims) with centroids for each cluster.
@@ -184,7 +205,7 @@ def Find_Centroids(adata, cluster_key='leiden', embedding_key='X_scVI', ndims=30
     
     centroids_df = pd.DataFrame(centroids)
     centroids_df['cluster'] = adata.obs[cluster_key].values
-    
+    # Filter for clusters that have at least one cell
     valid_clusters = []
     for cluster in adata.obs[cluster_key].cat.categories:
         if np.sum(adata.obs[cluster_key] == cluster) > 0:
@@ -200,20 +221,24 @@ def Find_Centroids(adata, cluster_key='leiden', embedding_key='X_scVI', ndims=30
         centroids_df = centroids_df.dropna()
         
     return centroids_df.values
-def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=1, min_cluster_size=4, batch_key=None, n_cores=None):
+def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=1, min_cluster_size=4, batch_key=None, n_cores=None, DE_batch_size=2048, icc_gpu=True, min_pval=0.05, pct_diff=0.7):
     """
     Performs one iteration of clustering and merging.
     Args:
-         adata: AnnData object containing the scRNA-seq data with the specified embedding in obsm.
+         adata: AnnData object containing the scRNA-seq data.
          ndims: Number of latent dimensions to use from the embedding.
          min_pct: Minimum percentage of cells expressing a gene to consider it for differential expression.
          min_log2_fc: Minimum log2 fold change for a gene to be considered differentially expressed.
-         batch_size: Batch size for scVI differential expression.
+         batch_size: Batch size for the CONCORD model.
          min_score: Minimum score for a gene to be considered differentially expressed.
          min_de_genes: Minimum number of differentially expressed genes required (returns score of 0 if below threshold).
          min_cluster_size: Minimum size of clusters to retain.
          batch_key: Key in adata.obs indicating batch information for CONCORD model.
          n_cores: Number of CPU cores to use for parallel processing. Default is max(1, cpu_count() - 1).
+         DE_batch_size: Batch size for GPU processing in dge_2samples.
+         icc_gpu: Use GPU for ICC weight computation in dge_2samples. Set to False to force CPU.
+         min_pval: Minimum BH-adjusted p-value for a gene to be considered differentially expressed.
+         pct_diff: Minimum percentage difference threshold for DE genes. If pct_1 > pct_2: pct_diff = (pct_1-pct_2)/pct_1. If pct_2 > pct_1: pct_diff = (pct_2-pct_1)/pct_2 (default: 0.7).
     Returns:
          adata: AnnData object with updated clustering in adata.obs['leiden'].
     """
@@ -247,7 +272,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
                 print(f"Warning: seurat_v3 HVG failed for cluster {cluster} ({str(e)}), using seurat flavor instead")
                 sc.pp.highly_variable_genes(cluster_adata, n_top_genes=n_genes, subset=False, flavor='seurat')
         
-        # Subset to highly variable genes for Concord
+        # Subset to highly variable genes for CONCORD
         hvg_genes = cluster_adata.var_names[cluster_adata.var['highly_variable']].tolist()
         
         # If no HVG found, skip this cluster
@@ -255,7 +280,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
             print(f"Warning: No highly variable genes found for cluster {cluster}, skipping")
             continue
         
-        # Check cluster size BEFORE attempting to fit Concord model
+        # Check cluster size BEFORE attempting to fit CONCORD model
         if cluster_adata.n_obs <= min_cluster_size:
             print(f"Warning: Cluster {cluster} has {cluster_adata.n_obs} cells (=< {min_cluster_size}), skipping")
             continue
@@ -265,7 +290,6 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
         # Adjust batch_size if it's larger than the number of observations
         effective_batch_size = min(batch_size, cluster_adata_hvg.n_obs)
         
-        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         ccd_model = ccd.Concord(adata=cluster_adata_hvg, input_feature=hvg_genes, domain_key=batch_key, 
                                 device=_DEVICE, preload_dense=False, batch_size=effective_batch_size, latent_dim=ndims,
                                 encoder_dims=[int(2**(np.floor(np.sqrt(ndims))+1))], save_dir=None) # Use encoder_dims = 2^(floor(sqrt(ndims))+1)
@@ -285,7 +309,8 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
             k = 20
         
         idx, distance = NNDescent(cluster_adata.obsm['Concord'][:, :ndims], n_neighbors=k).neighbor_graph
-        idx = idx[:, 1:]  # Drop self from sNN
+        # Drop self from kNN
+        idx = idx[:, 1:]
         n_cells = idx.shape[0]
         
         # Vectorized sNN calculation using sparse matrix operations
@@ -316,6 +341,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
         weights = cluster_adata.obsp['connectivities'].data
         g = ig.Graph(n=cluster_adata.n_obs, edges=list(zip(sources, targets)), 
                      edge_attrs={'weight': weights}, directed=False)
+        # Leiden clustering
         part = leidenalg.find_partition(g, leidenalg.RBConfigurationVertexPartition, resolution_parameter=1)
         cluster_adata.obs['leiden'] = [str(c) for c in part.membership]
         cluster_adata.obs['leiden'] = cluster_adata.obs['leiden'].astype('category')
@@ -330,7 +356,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
             
         changes_made = True
         merged_pairs = []
-        
+        # Check for merges until no more can be made
         while changes_made:
             changes_made = False
             
@@ -349,7 +375,6 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
             centroid_map = {subcluster: i for i, subcluster in enumerate(nonempty_sub_clusters)}
             
             # Build list of all pairs with their distances
-            from sklearn.metrics import pairwise_distances
             all_pairs = []
             
             for sub_cluster in nonempty_sub_clusters:
@@ -408,7 +433,8 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
                     cluster_adata.obs.loc[cluster_adata.obs['leiden'] == closest_sub_cluster, 'leiden'] = sub_cluster
                     merged_pairs.append((sub_cluster, str(closest_sub_cluster)))
                     changes_made = True
-                    break  # Recalculate after merge
+                    # Recalculate after merge
+                    break
                 
                 # Skip DE analysis if clusters are too small for reliable DE (but above min_cluster_size)
                 if n_cells_sub < 3 or n_cells_closest < 3:
@@ -416,13 +442,14 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
                     continue
                     
                 # Perform differential expression analysis for larger clusters
-                bayes_de_score = DE_Score(cluster_adata, sub_cluster, closest_sub_cluster, min_pct, min_log2_fc, min_de_genes, n_cores=n_cores)
+                bayes_de_score = DE_Score(cluster_adata, sub_cluster, closest_sub_cluster, min_pct, min_log2_fc, min_de_genes, n_cores=n_cores, DE_batch_size=DE_batch_size, icc_gpu=icc_gpu, min_pval=min_pval, pct_diff=pct_diff)
                 
                 if bayes_de_score < min_score:
                     cluster_adata.obs.loc[cluster_adata.obs['leiden'] == closest_sub_cluster, 'leiden'] = sub_cluster
                     merged_pairs.append((sub_cluster, str(closest_sub_cluster)))
                     changes_made = True
-                    break  # Recalculate after merge
+                    # Recalculate after merge
+                    break
                 else:
                     # Mark pair as tested but not merged
                     merged_pairs.append((sub_cluster, str(closest_sub_cluster)))
@@ -438,7 +465,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
             sorted_subclusters = sorted(final_nonempty_sub_clusters, key=lambda x: int(x))
             
             # Create hierarchical names by appending subcluster number to parent cluster
-            # First, collect all temp labels and add them to categories
+            # Collect all temp labels and add them to categories
             temp_labels_to_add = []
             for subcluster in sorted_subclusters:
                 temp_label = f"temp_{cluster}_{subcluster}"
@@ -450,7 +477,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
                 if new_categories:
                     adata.obs['leiden'] = adata.obs['leiden'].cat.add_categories(new_categories)
             
-            # Now assign the temp labels
+            # Assign the temp labels
             for subcluster in sorted_subclusters:
                 subcluster_mask = cluster_adata.obs['leiden'] == subcluster
                 original_indices = cluster_adata.obs.index[subcluster_mask]
@@ -541,7 +568,9 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
     adata.obs['leiden'] = adata.obs['leiden'].cat.remove_unused_categories()
     print('Clustering iteration complete. Number of clusters:', len(adata.obs['leiden'].cat.categories))
     return adata
-def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes, DE_batch_size=2048, n_cores=None):
+
+
+def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes, DE_batch_size=2048, n_cores=None, icc_gpu=True, min_pval=0.05, pct_diff=0.7):
     """
     Calculate differential expression score between two identities.
     Args:
@@ -553,12 +582,15 @@ def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes, DE_bat
         min_de_genes: Minimum number of differentially expressed genes required (returns score of 0 if below threshold).
         DE_batch_size: Batch size for GPU processing in dge_2samples (default: 2048).
         n_cores: Number of CPU cores to use for parallel processing. Default is max(1, cpu_count() - 1).
+        icc_gpu: Use GPU for ICC weight computation in dge_2samples. Set to False to force CPU.
+        min_pval: Minimum BH-adjusted p-value for a gene to be considered differentially expressed (default: 0.05).
+        pct_diff: Minimum percentage difference threshold for DE genes. If pct_1 > pct_2: pct_diff = (pct_1-pct_2)/pct_1. If pct_2 > pct_1: pct_diff = (pct_2-pct_1)/pct_2 (default: 0.7).
     Returns:
-        de_score: Differential expression score sum(min(-log10(p),20)).
+        de_score: Differential expression score sum(min(-log10(p_adj),20)).
     """
     if n_cores is None:
         n_cores = max(1, cpu_count() - 1)
-    
+    # Run differential expression analysis
     de_results = dge_2samples(
         adata,
         ident_1=ident_1,
@@ -571,94 +603,72 @@ def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes, DE_bat
         icc='i',
         df_correction=False,
         n_cores=n_cores,
-        gpu_batch_size=DE_batch_size
+        gpu_batch_size=DE_batch_size,
+        icc_gpu=icc_gpu
     )
     
     # Count number of DE genes meeting criteria
     de_genes = de_results[
         (abs(de_results['log2FC']) >= min_log2_fc) &
-        (de_results['p.value.adj'] <= 0.05)
+        (de_results['p.value.adj'] <= min_pval) & (de_results['Chi2.p.value'] <= 0.05)
     ]
 
     de_genes = de_genes[(de_genes['pct.1'] >= min_pct) | (de_genes['pct.2'] >= min_pct)]
-        
+    
+    # Apply pct_diff filter
+    pct_diff_values = np.where(
+        de_genes['pct.1'] > de_genes['pct.2'],
+        (de_genes['pct.1'] - de_genes['pct.2']) / de_genes['pct.1'],
+        (de_genes['pct.2'] - de_genes['pct.1']) / de_genes['pct.2']
+    )
+    de_genes = de_genes[pct_diff_values >= pct_diff]
+    
+    # Return 0 if not enough DE genes
     if de_genes.shape[0] < min_de_genes:
         return 0
-    
+    # Calculate DE score
     return np.sum(np.minimum(-np.log10(de_genes['p.value.adj']), 20))
-def dge_2samples(
-    adata,
-    features: Optional[List[str]] = None,
-    ident_1: Optional[str] = None,
-    ident_2: Optional[str] = None,
-    groupby: str = 'leiden',
-    fc_thr: float = 1.0,
-    min_pct: float = 0.0,
-    max_pval: float = 1.0,
-    min_count: int = 30,
-    icc: Union[str, float] = 'i',
-    df_correction: bool = False,
-    n_cores: int = 1,
-    use_gpu: bool = True,
-    gpu_batch_size: int = 2048
-) -> pd.DataFrame:
+def dge_2samples(adata, features=None, ident_1=None, ident_2=None, groupby='leiden', fc_thr=1.0, min_pct=0.0, max_pval=1.0, min_count=30, icc='i', df_correction=False, n_cores=1, use_gpu=True, gpu_batch_size=2048, icc_gpu=True):
     """
     Analyze differential gene expression between 2 identities using weighted t-test and chi-squared test.
-    
-    Parameters
-    ----------
-    adata : AnnData
-        Annotated data matrix with counts in .X or .raw.X
-    features : list of str, optional
-        List of genes to analyze. If None, all genes are analyzed.
-    ident_1 : str
-        First identity/group for comparison
-    ident_2 : str
-        Second identity/group for comparison
-    groupby : str
-        Column in adata.obs to use for grouping (default: 'leiden')
-    fc_thr : float
-        Fold-change threshold for reporting results
-    min_pct : float
-        Minimum fraction of cells expressing the gene in at least one group
-    max_pval : float
-        Maximum p-value for reporting results
-    min_count : int
-        Minimum aggregate count in at least one group
-    icc : str or float
-        Intracluster correlation coefficient method ('i' for iterative, 'A' for ANOVA, 0, or 1)
-    df_correction : bool
-        Apply correction for degrees of freedom (not recommended)
-    n_cores : int
-        Number of CPU cores for parallel processing
-    use_gpu : bool
-        Use GPU acceleration for chi-squared test (default: True if CUDA available)
-    gpu_batch_size : int
-        Number of genes to process per GPU batch (default: 2048)
-        
-    Returns
-    -------
-    pd.DataFrame
-        Results with columns: log2FC, p.value, p.value.adj, Chi2.p.value, pct.1, pct.2
+    Args:
+        adata: AnnData object containing the scRNA-seq data with counts in .X or .raw.X.
+        features: List of genes to analyze. If None, all genes are analyzed.
+        ident_1: First identity/group for comparison.
+        ident_2: Second identity/group for comparison.
+        groupby: Column in adata.obs to use for grouping (default: 'leiden').
+        fc_thr: Fold-change threshold for reporting results.
+        min_pct: Minimum fraction of cells expressing the gene in at least one group.
+        max_pval: Maximum p-value for reporting results.
+        min_count: Minimum aggregate count in at least one group.
+        icc: Intracluster correlation coefficient method ('i' for iterative, 'A' for ANOVA, 0, or 1).
+        df_correction: Apply correction for degrees of freedom (not recommended).
+        n_cores: Number of CPU cores for parallel processing.
+        use_gpu: Use GPU acceleration for chi-squared test (default: True if CUDA available).
+        gpu_batch_size: Number of genes to process per GPU batch (default: 2048).
+        icc_gpu: Use GPU for ICC weight computation (default: True). Set to False to force CPU.
+    Returns:
+        pd.DataFrame with columns: log2FC, p.value, p.value.adj, Chi2.p.value, pct.1, pct.2.
     """
+    # Run iterative weighted t-test
     iwt = iter_wght_ttest(
         adata, features, ident_1, ident_2, groupby, fc_thr, min_pct, 
         max_pval, min_count, icc, df_correction, n_cores,
-        use_gpu=use_gpu, gpu_batch_size=gpu_batch_size
+        use_gpu=use_gpu, gpu_batch_size=gpu_batch_size, icc_gpu=icc_gpu
     )
     
     # Use GPU-accelerated chi2 test if available and requested
     if use_gpu and _GPU_AVAILABLE:
         chi2 = chi2_test_gpu(
             adata, list(iwt.index), ident_1, ident_2, groupby, 
-            fc_thr=1.0, min_pct=0.0, max_pval=1.0, 
-            min_count=0, batch_size=gpu_batch_size
+            fc_thr=1.0, min_pct=0.0, max_pval=max_pval, 
+            min_count=0, batch_size=gpu_batch_size, device=None
         )
     else:
         # Fall back to CPU version
         chi2 = chi2_test(
             adata, list(iwt.index), ident_1, ident_2, groupby, 
-            fc_thr=1.0, min_pct=0.0, max_pval=1.0, 
+            fc_thr=1.0, min_pct=0.0, max_pval=max_pval, 
             min_count=0, n_cores=n_cores
         )
     
@@ -722,35 +732,24 @@ def _chi2_contingency_gpu(observed: torch.Tensor) -> torch.Tensor:
     return p_values
 
 
-def chi2_test_gpu(
-    adata,
-    features: Optional[List[str]] = None,
-    ident_1: Optional[str] = None,
-    ident_2: Optional[str] = None,
-    groupby: str = 'leiden',
-    fc_thr: float = 1.0,
-    min_pct: float = 0.0,
-    max_pval: float = 1.0,
-    min_count: int = 30,
-    batch_size: int = 1000,
-    device: Optional[torch.device] = None
-) -> pd.DataFrame:
+def chi2_test_gpu(adata, features=None, ident_1=None, ident_2=None, groupby='leiden', fc_thr=1.0, min_pct=0.0, max_pval=1.0, min_count=30, batch_size=1000, device=None):
     """
     GPU-accelerated chi-squared test for differential gene expression.
-    
-    Uses PyTorch for vectorized operations on GPU for ~5-10x speedup.
-    
-    Parameters
-    ----------
-    batch_size : int
-        Number of genes to process in parallel on GPU
-    device : torch.device, optional
-        Device to use. If None, uses CUDA if available
-        
-    Returns
-    -------
-    pd.DataFrame
-        Results with columns: log2FC, p.value
+    Uses PyTorch for vectorized operations on GPU.
+    Args:
+        adata: AnnData object containing the scRNA-seq data.
+        features: List of genes to analyze. If None, all genes are analyzed.
+        ident_1: First identity/group for comparison.
+        ident_2: Second identity/group for comparison.
+        groupby: Column in adata.obs to use for grouping (default: 'leiden').
+        fc_thr: Fold-change threshold for reporting results.
+        min_pct: Minimum fraction of cells expressing the gene in at least one group.
+        max_pval: Maximum p-value for reporting results.
+        min_count: Minimum aggregate count in at least one group.
+        batch_size: Number of genes to process per GPU batch (default: 1000).
+        device: PyTorch device to use (e.g., 'cuda:0'). If None, uses default _DEVICE.
+    Returns:
+        pd.DataFrame with columns: log2FC, p.value.
     """
     if ident_1 is None or ident_2 is None:
         raise ValueError("Both ident_1 and ident_2 must be defined")
@@ -849,7 +848,7 @@ def chi2_test_gpu(
             continue
         
         # Compute fold changes
-        fc_batch = (ac1_batch / TC_1) / (ac2_batch / TC_2)
+        fc_batch = (ac1_batch / (TC_1)+np.finfo(np.float32).tiny) / (ac2_batch / (TC_2)+np.finfo(np.float32).tiny)
         fc_mask = (fc_batch >= fc_thr) | (fc_batch <= 1/fc_thr)
         valid_mask = valid_mask & fc_mask
         
@@ -863,7 +862,6 @@ def chi2_test_gpu(
         fc_valid = fc_batch[valid_idx]
         
         # Build contingency tables for GPU
-        # Shape: (n_valid_genes, 2, 2)
         cont_tables = np.stack([
             np.stack([TC_1 - ac1_valid, TC_2 - ac2_valid], axis=1),
             np.stack([ac1_valid, ac2_valid], axis=1)
@@ -883,7 +881,7 @@ def chi2_test_gpu(
                 orig_idx = valid_idx[i]
                 results.append({
                     'gene': batch_names[orig_idx],
-                    'log2FC': np.log2(fc_valid[i]),
+                    'log2FC': np.log2(fc_valid[i]+np.finfo(np.float32).tiny),
                     'p.value': float(p_val)
                 })
     
@@ -896,25 +894,22 @@ def chi2_test_gpu(
     return output
 
 
-def chi2_test(
-    adata,
-    features: Optional[List[str]] = None,
-    ident_1: Optional[str] = None,
-    ident_2: Optional[str] = None,
-    groupby: str = 'leiden',
-    fc_thr: float = 1.0,
-    min_pct: float = 0.0,
-    max_pval: float = 1.0,
-    min_count: int = 30,
-    n_cores: int = 1
-) -> pd.DataFrame:
+def chi2_test(adata, features=None, ident_1=None, ident_2=None, groupby='leiden', fc_thr=1.0, min_pct=0.0, max_pval=1.0, min_count=30, n_cores=1):
     """
     Perform chi-squared test for differential gene expression.
-    
-    Returns
-    -------
-    pd.DataFrame
-        Results with columns: log2FC, p.value
+    Args:
+        adata: AnnData object containing the scRNA-seq data.
+        features: List of genes to analyze. If None, all genes are analyzed.
+        ident_1: First identity/group for comparison.
+        ident_2: Second identity/group for comparison.
+        groupby: Column in adata.obs to use for grouping (default: 'leiden').
+        fc_thr: Fold-change threshold for reporting results.
+        min_pct: Minimum fraction of cells expressing the gene in at least one group.
+        max_pval: Maximum p-value for reporting results.
+        min_count: Minimum aggregate count in at least one group.
+        n_cores: Number of CPU cores for parallel processing.
+    Returns:
+        pd.DataFrame with columns: log2FC, p.value.
     """
     if ident_1 is None or ident_2 is None:
         raise ValueError("Both ident_1 and ident_2 must be defined")
@@ -1082,22 +1077,16 @@ def _process_gene_weighted_ttest(args):
     return None
 
 
-def _weighted_ttest_gpu(x1_batch: torch.Tensor, x2_batch: torch.Tensor, 
-                        w1_batch: torch.Tensor, w2_batch: torch.Tensor) -> torch.Tensor:
+def _weighted_ttest_gpu(x1_batch, x2_batch, w1_batch, w2_batch):
     """
-    Vectorized weighted t-test for multiple genes on GPU.
-    
-    Parameters
-    ----------
-    x1_batch, x2_batch : torch.Tensor
-        Data tensors of shape (n_genes, n_cells_per_group)
-    w1_batch, w2_batch : torch.Tensor
-        Weight tensors of shape (n_genes, n_cells_per_group)
-        
-    Returns
-    -------
-    torch.Tensor
-        P-values for each gene
+    Helper function to compute weighted t-test statistics on GPU using PyTorch.
+    Args:
+        x1_batch: Tensor of shape (n_genes, n_cells_1) with expression values for group 1.
+        x2_batch: Tensor of shape (n_genes, n_cells_2) with expression values for group 2.
+        w1_batch: Tensor of shape (n_genes, n_cells_1) with weights for group 1.
+        w2_batch: Tensor of shape (n_genes, n_cells_2) with weights for group 2.
+    Returns:
+        p_values: Tensor of shape (n_genes,) with p-values for each gene.
     """
     # Normalize weights per gene
     w1_sum = w1_batch.sum(dim=1, keepdim=True)
@@ -1118,7 +1107,7 @@ def _weighted_ttest_gpu(x1_batch: torch.Tensor, x2_batch: torch.Tensor,
     
     # Standard error
     s12 = torch.sqrt(vm1 + vm2)
-    s12 = torch.clamp(s12, min=1e-10)  # Avoid division by zero
+    s12 = torch.clamp(s12, min=1e-10)
     
     # T-statistic
     t = (m1 - m2) / s12
@@ -1126,62 +1115,37 @@ def _weighted_ttest_gpu(x1_batch: torch.Tensor, x2_batch: torch.Tensor,
     # Degrees of freedom (approximate)
     df = x1_batch.shape[1] + x2_batch.shape[1] - 2
     
-    # P-value using t-distribution approximation
-    # For large df, t-distribution approaches normal
-    if df > 30:
-        # Use normal approximation
-        z = torch.abs(t)
-        if hasattr(torch.special, 'erfc'):
-            p_values = torch.special.erfc(z / np.sqrt(2))
-        else:
-            # Fallback to CPU for p-value calculation
-            from scipy.stats import t as t_dist
-            t_cpu = t.cpu().numpy()
-            p_values = torch.from_numpy(2 * t_dist.sf(np.abs(t_cpu), df=df)).to(t.device)
-    else:
-        # Use scipy on CPU for accurate small-sample p-values
-        from scipy.stats import t as t_dist
-        t_cpu = t.cpu().numpy()
-        p_values = torch.from_numpy(2 * t_dist.sf(np.abs(t_cpu), df=df)).to(t.device)
+    # P-value using scipy.stats (CPU) for Student's t distribution
+    t_cpu = t.detach().cpu().numpy()
+    p_values_cpu = 2 * stats.t.sf(np.abs(t_cpu), df)
+    p_values = torch.from_numpy(p_values_cpu).to(t.device, dtype=t.dtype)
     
     return p_values
 
 
-def iter_wght_ttest_gpu(
-    adata,
-    features: Optional[List[str]] = None,
-    ident_1: Optional[str] = None,
-    ident_2: Optional[str] = None,
-    groupby: str = 'leiden',
-    fc_thr: float = 1.0,
-    min_pct: float = 0.0,
-    max_pval: float = 1.0,
-    min_count: int = 30,
-    icc: Union[str, float] = 'i',
-    df_correction: bool = False,
-    batch_size: int = 500,
-    device: Optional[torch.device] = None,
-    n_cores: int = 1
-) -> pd.DataFrame:
+def iter_wght_ttest_gpu(adata, features=None, ident_1=None, ident_2=None, groupby='leiden', fc_thr=1.0, min_pct=0.0, max_pval=1.0, min_count=30, icc='i', df_correction=False, batch_size=500, device=None, n_cores=1, icc_gpu=True):
     """
     GPU-accelerated weighted t-test with iterative weight calculation.
-    
-    Uses PyTorch for vectorized operations. ICC weights computed on CPU (still fast),
-    but t-test statistics computed in batches on GPU for ~3-5x speedup.
-    
-    Parameters
-    ----------
-    batch_size : int
-        Number of genes to process in parallel on GPU (default: 500)
-    device : torch.device, optional
-        Device to use. If None, uses CUDA if available
-    n_cores : int
-        Number of CPU cores for parallel ICC weight computation (default: 1)
-        
-    Returns
-    -------
-    pd.DataFrame
-        Results with columns: log2FC, p.value, p.value.adj, pct.1, pct.2
+    Uses PyTorch for vectorized operations. ICC weights computed based on icc_gpu setting,
+    and t-test statistics computed in batches on GPU for ~3-5x speedup.
+    Args:
+        adata: AnnData object containing the scRNA-seq data.
+        features: List of genes to analyze. If None, all genes are analyzed.
+        ident_1: First identity/group for comparison.
+        ident_2: Second identity/group for comparison.
+        groupby: Column in adata.obs to use for grouping (default: 'leiden').
+        fc_thr: Fold-change threshold for reporting results.
+        min_pct: Minimum fraction of cells expressing the gene in at least one group.
+        max_pval: Maximum p-value for reporting results.
+        min_count: Minimum aggregate count in at least one group.
+        icc: Intracluster correlation coefficient method.
+        df_correction: Apply correction for degrees of freedom.
+        batch_size: Number of genes to process in parallel on GPU (default: 500).
+        device: Device to use. If None, uses CUDA if available.
+        n_cores: Number of CPU cores for parallel ICC weight computation (default: 1).
+        icc_gpu: Use GPU for ICC weight computation (default: True). Set to False to force CPU.
+    Returns:
+        pd.DataFrame with columns: log2FC, p.value, p.value.adj, pct.1, pct.2.
     """
     if ident_1 is None or ident_2 is None:
         raise ValueError("Both ident_1 and ident_2 must be defined")
@@ -1268,8 +1232,8 @@ def iter_wght_ttest_gpu(
             xi2_list = [Xi_2[:, idx] for idx in batch_indices]
         
         # Stack into arrays
-        h1_batch = np.stack(h1_list, axis=0)  # (n_genes, n_cells_1)
-        h2_batch = np.stack(h2_list, axis=0)  # (n_genes, n_cells_2)
+        h1_batch = np.stack(h1_list, axis=0)
+        h2_batch = np.stack(h2_list, axis=0)
         xi1_batch = np.stack(xi1_list, axis=0)
         xi2_batch = np.stack(xi2_list, axis=0)
         
@@ -1292,8 +1256,8 @@ def iter_wght_ttest_gpu(
         valid_h1 = [h1_batch[i] for i in range(len(batch_genes)) if valid_mask[i]]
         valid_h2 = [h2_batch[i] for i in range(len(batch_genes)) if valid_mask[i]]
         
-        w1_list = compute_icc_weights_parallel(valid_h1, Ni_1, icc, n_cores)
-        w2_list = compute_icc_weights_parallel(valid_h2, Ni_2, icc, n_cores)
+        w1_list = compute_icc_weights_parallel(valid_h1, Ni_1, icc, n_cores, icc_gpu=icc_gpu)
+        w2_list = compute_icc_weights_parallel(valid_h2, Ni_2, icc, n_cores, icc_gpu=icc_gpu)
         
         if len(w1_list) == 0:
             continue
@@ -1343,7 +1307,7 @@ def iter_wght_ttest_gpu(
                 orig_idx = valid_idx[fc_valid_idx[i]]
                 results.append({
                     'gene': batch_names[orig_idx],
-                    'log2FC': np.log2(fc_final[i]),
+                    'log2FC': np.log2(fc_final[i] + np.finfo(np.float32).tiny),
                     'p.value': float(p_val),
                     'pct.1': pct_1[orig_idx],
                     'pct.2': pct_2[orig_idx]
@@ -1363,42 +1327,33 @@ def iter_wght_ttest_gpu(
     return output
 
 
-def iter_wght_ttest(
-    adata,
-    features: Optional[List[str]] = None,
-    ident_1: Optional[str] = None,
-    ident_2: Optional[str] = None,
-    groupby: str = 'leiden',
-    fc_thr: float = 1.0,
-    min_pct: float = 0.0,
-    max_pval: float = 1.0,
-    min_count: int = 30,
-    icc: Union[str, float] = 'i',
-    df_correction: bool = False,
-    n_cores: int = 1,
-    use_gpu: bool = True,
-    gpu_batch_size: int = 500
-) -> pd.DataFrame:
+def iter_wght_ttest(adata, features=None, ident_1=None, ident_2=None, groupby='leiden', fc_thr=1.0, min_pct=0.0, max_pval=1.0, min_count=30, icc='i', df_correction=False, n_cores=1, use_gpu=True, gpu_batch_size=500, icc_gpu=True):
     """
     Perform weighted t-test with iterative weight calculation.
-    
-    Parameters
-    ----------
-    use_gpu : bool
-        Use GPU acceleration if available (default: True)
-    gpu_batch_size : int
-        Number of genes to process per GPU batch (default: 500)
-    
-    Returns
-    -------
-    pd.DataFrame
-        Results with columns: log2FC, p.value, p.value.adj, pct.1, pct.2
+    Args:
+        adata: AnnData object containing the scRNA-seq data.
+        features: List of genes to analyze. If None, all genes are analyzed.
+        ident_1: First identity/group for comparison.
+        ident_2: Second identity/group for comparison.
+        groupby: Column in adata.obs to use for grouping (default: 'leiden').
+        fc_thr: Fold-change threshold for reporting results.
+        min_pct: Minimum fraction of cells expressing the gene in at least one group.
+        max_pval: Maximum p-value for reporting results.
+        min_count: Minimum aggregate count in at least one group.
+        icc: Intracluster correlation coefficient method.
+        df_correction: Apply correction for degrees of freedom.
+        n_cores: Number of CPU cores for parallel processing.
+        use_gpu: Use GPU acceleration if available (default: True).
+        gpu_batch_size: Number of genes to process per GPU batch (default: 500).
+        icc_gpu: Use GPU for ICC weight computation (default: True). Set to False to force CPU.
+    Returns:
+        pd.DataFrame with columns: log2FC, p.value, p.value.adj, pct.1, pct.2.
     """
     # Use GPU version if requested and available
     if use_gpu and _GPU_AVAILABLE:
         return iter_wght_ttest_gpu(
             adata, features, ident_1, ident_2, groupby, fc_thr, min_pct,
-            max_pval, min_count, icc, df_correction, gpu_batch_size, n_cores=n_cores
+            max_pval, min_count, icc, df_correction, gpu_batch_size, device=None, n_cores=n_cores, icc_gpu=icc_gpu
         )
     
     # Fall back to CPU version
@@ -1494,21 +1449,14 @@ def iter_wght_ttest(
     return output
 
 
-def alt_wttest(x1: np.ndarray, x2: np.ndarray, w1: np.ndarray, w2: np.ndarray) -> float:
+def alt_wttest(x1, x2, w1, w2):
     """
     Alternative weighted t-test based on Margolin-Leikin variance estimator.
-    
-    Parameters
-    ----------
-    x1, x2 : array
-        Data arrays for groups 1 and 2
-    w1, w2 : array
-        Weight arrays for groups 1 and 2
-        
-    Returns
-    -------
-    float
-        P-value from weighted t-test
+    Args:
+        x1, x2: Data arrays for groups 1 and 2.
+        w1, w2: Weight arrays for groups 1 and 2.
+    Returns:
+        P-value from weighted t-test.
     """
     if len(x1) != len(w1) or len(x2) != len(w2):
         raise ValueError("Length mismatch between data and weights")
@@ -1543,21 +1491,14 @@ def alt_wttest(x1: np.ndarray, x2: np.ndarray, w1: np.ndarray, w2: np.ndarray) -
     return p
 
 
-def alt_wttest2(x1: np.ndarray, x2: np.ndarray, w1: np.ndarray, w2: np.ndarray) -> float:
+def alt_wttest2(x1, x2, w1, w2):
     """
     Alternative weighted t-test with effective degrees of freedom correction.
-    
-    Parameters
-    ----------
-    x1, x2 : array
-        Data arrays for groups 1 and 2
-    w1, w2 : array
-        Weight arrays for groups 1 and 2
-        
-    Returns
-    -------
-    float
-        P-value from weighted t-test
+    Args:
+        x1, x2: Data arrays for groups 1 and 2.
+        w1, w2: Weight arrays for groups 1 and 2.
+    Returns:
+        P-value from weighted t-test.
     """
     if len(x1) != len(w1) or len(x2) != len(w2):
         raise ValueError("Length mismatch between data and weights")
@@ -1599,18 +1540,11 @@ def alt_wttest2(x1: np.ndarray, x2: np.ndarray, w1: np.ndarray, w2: np.ndarray) 
 def icc_an(h: np.ndarray, n: np.ndarray) -> float:
     """
     Calculate ANOVA intracluster correlation coefficient (ICC).
-    
-    Parameters
-    ----------
-    h : array
-        Count values
-    n : array
-        Total counts per observation
-        
-    Returns
-    -------
-    float
-        ICC value (clamped to [0, 1])
+    Args:
+        h: Count values.
+        n: Total counts per observation.
+    Returns:
+        ICC value (clamped to [0, 1]).
     """
     N = n.sum()
     k = len(n)
@@ -1631,21 +1565,14 @@ def icc_an(h: np.ndarray, n: np.ndarray) -> float:
     return np.clip(icc, 0.0, 1.0)
 
 
-def icc_iter(h: np.ndarray, n: np.ndarray) -> float:
+def icc_iter(h, n):
     """
     Calculate iterative ICC providing more accurate variance matching.
-    
-    Parameters
-    ----------
-    h : array
-        Count values
-    n : array
-        Total counts per observation
-        
-    Returns
-    -------
-    float
-        ICC value (clamped to [0, 1])
+    Args:
+        h: Count values.
+        n: Total counts per observation.
+    Returns:
+        ICC value (clamped to [0, 1]).
     """
     x = h / n
     sum_n = n.sum()
@@ -1674,69 +1601,334 @@ def icc_iter(h: np.ndarray, n: np.ndarray) -> float:
         return VarE - VarT
     
     try:
-        icc_val = brentq(f, 0, 1, args=(x, n), xtol=1e-4/n.max())
+        icc_val = brenth(f, 0, 1, args=(x, n), xtol=1e-4/n.max())
         return min(icc_val, 1.0)
     except ValueError:
         return 0.0
 
 
-def compute_icc_weights_parallel(h_list, n, icc, n_cores=1):
+def compute_icc_weights_parallel(h_list, n, icc, n_cores=1, icc_gpu=True):
     """
-    Compute ICC weights for multiple genes in parallel using joblib.
+    Compute ICC weights for multiple genes, with GPU acceleration if available.
+    Uses CuPy for GPU-accelerated batch processing when available and beneficial.
+    Falls back to CPU sequential processing otherwise.
+    Args:
+        h_list: List of count arrays, one per gene.
+        n: Total counts per observation (same for all genes).
+        icc: ICC method: 'i' (iterative), 'A' (ANOVA), 0, or 1.
+        n_cores: Kept for API compatibility (not used).
+        icc_gpu: Use GPU for ICC computation if available (default: True).
+    Returns:
+        List of weight arrays, one per gene.
+    """
+    # Use GPU batch processing if enabled, CuPy is available, and we have enough genes
+    # Custom CUDA kernel makes GPU worthwhile even for smaller batches
+    if icc_gpu and _CUPY_AVAILABLE:
+        try:
+            if icc in [0, 1] and len(h_list) >= 10:
+                return _compute_icc_weights_gpu_batch(h_list, n, icc)
+            elif icc in ['i', 'A'] and len(h_list) >= 50:
+                return _compute_icc_weights_gpu_rootfinding(h_list, n, icc)
+        except Exception:
+            # Fallback to CPU if GPU processing fails
+            pass
     
-    joblib uses memory mapping for efficient numpy array serialization,
-    avoiding the expensive pickling overhead of standard multiprocessing.
+    # Sequential CPU processing
+    return [icc_weight(h, n, icc) for h in h_list]
+
+
+def _compute_icc_weights_gpu_batch(h_list, n, icc_val):
+    """
+    GPU-accelerated batch computation of ICC weights for multiple genes.
+    Optimized with cached n array and pinned memory for minimal I/O overhead.
+    Args:
+        h_list: List of count arrays, one per gene (genes x samples).
+        n: Total counts per observation (same for all genes).
+        icc_val: Fixed ICC value (0 or 1).
+    Returns:
+        List of weight arrays, one per gene.
+    """
+    # Use cached n array on GPU if available (eliminates repeated transfers)
+    n_hash = hash(n.tobytes())
+    if _GPU_CACHE.get('n_hash') == n_hash:
+        n_gpu = _GPU_CACHE['n_array']
+    else:
+        n_gpu = cp.asarray(n, dtype=cp.float32)
+        _GPU_CACHE['n_array'] = n_gpu
+        _GPU_CACHE['n_hash'] = n_hash
     
-    Parameters
-    ----------
-    h_list : list of arrays
-        List of count arrays, one per gene
-    n : array
-        Total counts per observation (same for all genes)
-    icc : str or float
-        ICC method: 'i' (iterative), 'A' (ANOVA), 0, or 1
-    n_cores : int
-        Number of cores to use for parallel processing. Default is 1.
-        If n_cores > 1, uses joblib for parallel computation.
+    # Stack genes using pinned memory for faster transfer
+    h_stacked = np.stack(h_list, axis=0).astype(np.float32)
+    h_matrix = cp.asarray(h_stacked)
+    
+    # Vectorized computation across all genes
+    wprop = n_gpu / (1 + float(icc_val) * (n_gpu - 1))
+    wprop_sum = wprop.sum()
+    weights = wprop / wprop_sum
+    
+    # Use pinned memory for faster GPU→CPU transfer
+    weights_cpu = cp.asnumpy(weights)
+    return list(weights_cpu)
+
+
+def _compute_icc_weights_gpu_rootfinding(h_list, n, icc_method):
+    """
+    GPU-accelerated batch root-finding for ICC computation across multiple genes.
+    Optimized with cached n array, pinned memory, and minimized transfers.
+    Args:
+        h_list: List of count arrays, one per gene (genes x samples).
+        n: Total counts per observation (same for all genes).
+        icc_method: ICC method: 'i' (iterative) or 'A' (ANOVA).
+    Returns:
+        List of weight arrays, one per gene.
+    """
+    # Use cached n array on GPU (eliminates repeated transfers)
+    n_hash = hash(n.tobytes())
+    if _GPU_CACHE.get('n_hash') == n_hash:
+        n_gpu = _GPU_CACHE['n_array']
+    else:
+        n_gpu = cp.asarray(n, dtype=cp.float32)
+        _GPU_CACHE['n_array'] = n_gpu
+        _GPU_CACHE['n_hash'] = n_hash
+    
+    # Stack and transfer h using contiguous array for optimal transfer speed
+    h_stacked = np.ascontiguousarray(np.stack(h_list, axis=0), dtype=np.float32)
+    h_matrix = cp.asarray(h_stacked)
+    n_genes = h_matrix.shape[0]
+    
+    # Compute x = h/n for all genes
+    x_matrix = h_matrix / n_gpu
+    sum_n = n_gpu.sum()
+    
+    # Initial weights (same for all genes)
+    w0 = n_gpu / sum_n
+    w0_sq_sum = (w0**2).sum()
+    
+    # Compute initial values for each gene
+    x0 = (x_matrix * w0).sum(axis=1)
+    VarT0 = x0 * (1 - x0) / sum_n
+    VarE0 = ((w0**2) * (x_matrix - x0[:, None])**2).sum(axis=1) / (1 - w0_sq_sum)
+    
+    # Initialize ICC values
+    icc_vals = cp.zeros(n_genes, dtype=cp.float32)
+    
+    # Only solve for genes where VarE0 > VarT0
+    needs_solving = VarE0 > VarT0
+    
+    if needs_solving.any():
+        # Vectorized bisection for genes that need solving
+        icc_vals[needs_solving] = _gpu_bisection_icc(
+            x_matrix[needs_solving],
+            n_gpu,
+            xtol=1e-4 / n_gpu.max()
+        )
+        # Clamp to [0, 1]
+        icc_vals = cp.clip(icc_vals, 0.0, 1.0)
+    
+    # Compute final weights for all genes
+    wprop = n_gpu / (1 + icc_vals[:, None] * (n_gpu - 1))
+    wprop_sum = wprop.sum(axis=1, keepdims=True)
+    weights = wprop / wprop_sum
+    
+    # Transfer back to CPU efficiently and return list of views
+    weights_cpu = cp.asnumpy(weights)
+    return list(weights_cpu)
+
+
+# Custom CUDA kernel for ultra-fast parallel bisection (using global memory)
+_ICC_BISECTION_KERNEL = r'''
+extern "C" __global__
+void icc_bisection_kernel(
+    const float* x_matrix,  // (n_genes, n_samples)
+    const float* n_vals,    // (n_samples,)
+    float* icc_out,         // (n_genes,)
+    const int n_genes,
+    const int n_samples,
+    const float xtol,
+    const int max_iter
+) {
+    int gene_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gene_idx >= n_genes) return;
+    
+    const float* x = &x_matrix[gene_idx * n_samples];
+    
+    // Bisection bounds
+    float a = 0.0f;
+    float b = 0.5f;  // ICC rarely > 0.5
+    
+    // Bisection iterations
+    for (int iter = 0; iter < max_iter; iter++) {
+        float c = (a + b) * 0.5f;
         
-    Returns
-    -------
-    list of arrays
-        List of weight arrays, one per gene
+        // Evaluate objective at a
+        float sum_wprop_a = 0.0f;
+        #pragma unroll 4
+        for (int i = 0; i < n_samples; i++) {
+            sum_wprop_a += n_vals[i] / (1.0f + a * (n_vals[i] - 1.0f));
+        }
+        float x1_a = 0.0f;
+        float w_sq_sum_a = 0.0f;
+        #pragma unroll 4
+        for (int i = 0; i < n_samples; i++) {
+            float w = (n_vals[i] / (1.0f + a * (n_vals[i] - 1.0f))) / sum_wprop_a;
+            x1_a += x[i] * w;
+            w_sq_sum_a += w * w;
+        }
+        float VarT_a = x1_a * (1.0f - x1_a) / sum_wprop_a;
+        float VarE_a = 0.0f;
+        #pragma unroll 4
+        for (int i = 0; i < n_samples; i++) {
+            float w = (n_vals[i] / (1.0f + a * (n_vals[i] - 1.0f))) / sum_wprop_a;
+            float diff = x[i] - x1_a;
+            VarE_a += w * w * diff * diff;
+        }
+        VarE_a /= (1.0f - w_sq_sum_a);
+        float fa = VarE_a - VarT_a;
+        
+        // Evaluate objective at c
+        float sum_wprop_c = 0.0f;
+        #pragma unroll 4
+        for (int i = 0; i < n_samples; i++) {
+            sum_wprop_c += n_vals[i] / (1.0f + c * (n_vals[i] - 1.0f));
+        }
+        float x1_c = 0.0f;
+        float w_sq_sum_c = 0.0f;
+        #pragma unroll 4
+        for (int i = 0; i < n_samples; i++) {
+            float w = (n_vals[i] / (1.0f + c * (n_vals[i] - 1.0f))) / sum_wprop_c;
+            x1_c += x[i] * w;
+            w_sq_sum_c += w * w;
+        }
+        float VarT_c = x1_c * (1.0f - x1_c) / sum_wprop_c;
+        float VarE_c = 0.0f;
+        #pragma unroll 4
+        for (int i = 0; i < n_samples; i++) {
+            float w = (n_vals[i] / (1.0f + c * (n_vals[i] - 1.0f))) / sum_wprop_c;
+            float diff = x[i] - x1_c;
+            VarE_c += w * w * diff * diff;
+        }
+        VarE_c /= (1.0f - w_sq_sum_c);
+        float fc = VarE_c - VarT_c;
+        
+        // Update bounds
+        if (fa * fc > 0.0f) {
+            a = c;
+        } else {
+            b = c;
+        }
+        
+        // Check convergence
+        if (b - a < xtol) break;
+    }
+    
+    // Output result
+    icc_out[gene_idx] = (a + b) * 0.5f;
+}
+'''
+
+# Compile kernel on first use
+_compiled_kernel = None
+
+def _get_compiled_kernel():
+    global _compiled_kernel
+    if _compiled_kernel is None:
+        _compiled_kernel = cp.RawKernel(_ICC_BISECTION_KERNEL, 'icc_bisection_kernel')
+    return _compiled_kernel
+
+
+def _gpu_bisection_icc(x_matrix, n_gpu, xtol=1e-6, max_iter=30):
     """
-    # Only use parallel processing if worth the overhead
-    if n_cores <= 1 or len(h_list) < 20:
-        # Sequential processing for single core or small workloads
-        return [icc_weight(h, n, icc) for h in h_list]
+    Ultra-fast GPU bisection using custom CUDA kernel.
+    Each gene gets its own GPU thread for true parallel processing.
+    Args:
+        x_matrix: Gene expression ratios (cupy array), shape (n_genes, n_samples).
+        n_gpu: Total counts per sample (cupy array), shape (n_samples,).
+        xtol: Tolerance for convergence.
+        max_iter: Maximum iterations.
+    Returns:
+        ICC values for each gene (cupy array), shape (n_genes,).
+    """
+    n_genes, n_samples = x_matrix.shape
     
-    # joblib with loky backend has efficient numpy serialization via memory mapping
-    # batch_size controls how many tasks are sent to each worker (reduces overhead)
-    batch_size = max(1, len(h_list) // (n_cores * 4))
+    # Output array
+    icc_out = cp.empty(n_genes, dtype=cp.float32)
     
-    results = Parallel(n_jobs=n_cores, backend='loky', batch_size=batch_size)(
-        delayed(icc_weight)(h, n, icc) for h in h_list
-    )
+    # Optimal block size for most GPUs
+    block_size = 128
+    grid_size = (n_genes + block_size - 1) // block_size
     
-    return results
+    try:
+        kernel = _get_compiled_kernel()
+        kernel(
+            (grid_size,), (block_size,),
+            (x_matrix, n_gpu, icc_out, n_genes, n_samples, xtol, max_iter)
+        )
+        cp.cuda.Stream.null.synchronize()  # Ensure kernel completes
+    except Exception:
+        # Fallback to Python implementation if kernel fails
+        return _gpu_bisection_icc_fallback(x_matrix, n_gpu, xtol, max_iter)
+    
+    return icc_out
 
 
-def icc_weight(h: np.ndarray, n: np.ndarray, icc: Union[str, float] = 'i') -> np.ndarray:
+def _gpu_bisection_icc_fallback(x_matrix, n_gpu, xtol=1e-6, max_iter=30):
+    """
+    Fallback pure CuPy implementation if custom kernel fails.
+    Args:
+        x_matrix: Gene expression ratios (cupy array), shape (n_genes, n_samples).
+        n_gpu: Total counts per sample (cupy array), shape (n_samples,).
+        xtol: Tolerance for convergence.
+        max_iter: Maximum iterations.
+    Returns:
+        ICC values for each gene (cupy array), shape (n_genes,).
+    """
+    n_genes = x_matrix.shape[0]
+    n_minus_1 = n_gpu - 1
+    a = cp.zeros(n_genes, dtype=cp.float32)
+    b = cp.full(n_genes, 0.5, dtype=cp.float32)
+    
+    for iteration in range(max_iter):
+        c = (a + b) * 0.5
+        
+        # Eval at a
+        wprop_a = n_gpu / (1 + a[:, None] * n_minus_1)
+        sum_wprop_a = wprop_a.sum(axis=1, keepdims=True)
+        w_a = wprop_a / sum_wprop_a
+        x1_a = (x_matrix * w_a).sum(axis=1)
+        VarT_a = x1_a * (1 - x1_a) / sum_wprop_a.squeeze()
+        w_sq_a = w_a * w_a
+        VarE_a = (w_sq_a * (x_matrix - x1_a[:, None])**2).sum(axis=1) / (1 - w_sq_a.sum(axis=1))
+        fa = VarE_a - VarT_a
+        
+        # Eval at c
+        wprop_c = n_gpu / (1 + c[:, None] * n_minus_1)
+        sum_wprop_c = wprop_c.sum(axis=1, keepdims=True)
+        w_c = wprop_c / sum_wprop_c
+        x1_c = (x_matrix * w_c).sum(axis=1)
+        VarT_c = x1_c * (1 - x1_c) / sum_wprop_c.squeeze()
+        w_sq_c = w_c * w_c
+        VarE_c = (w_sq_c * (x_matrix - x1_c[:, None])**2).sum(axis=1) / (1 - w_sq_c.sum(axis=1))
+        fc = VarE_c - VarT_c
+        
+        same_sign = (fa * fc) > 0
+        a = cp.where(same_sign, c, a)
+        b = cp.where(same_sign, b, c)
+        
+        if cp.all((b - a) < xtol):
+            break
+    
+    return (a + b) * 0.5
+
+
+def icc_weight(h, n, icc='i'):
     """
     Calculate statistical weights based on ICC.
-    
-    Parameters
-    ----------
-    h : array
-        Count values
-    n : array
-        Total counts per observation
-    icc : str or float
-        ICC method: 'i' (iterative), 'A' (ANOVA), 0, or 1
-        
-    Returns
-    -------
-    array
-        Normalized weights
+    Args:
+        h: Count values.
+        n: Total counts per observation.
+        icc: ICC method: 'i' (iterative), 'A' (ANOVA), 0, or 1.
+    Returns:
+        Normalized weights.
     """
     Nc = len(n)
     
@@ -1764,459 +1956,6 @@ def icc_weight(h: np.ndarray, n: np.ndarray, icc: Union[str, float] = 'i') -> np
     wprop = n / (1 + icc_val * (n - 1))
     return wprop / wprop.sum()
 
-
-def dge_multisample(
-    adata,
-    samples_1: List[str],
-    samples_2: List[str],
-    sample_key: str = 'sample',
-    features: Optional[List[str]] = None,
-    t_test: bool = False,
-    min_pct: float = 0.03,
-    fc_thr: float = 1.0,
-    max_pval: float = 1.0,
-    icc: Union[str, float] = 'i',
-    df_correction: bool = False,
-    n_cores: int = 1
-) -> Dict:
-    """
-    Perform multi-sample differential gene expression analysis.
-    
-    Parameters
-    ----------
-    adata : AnnData
-        Annotated data matrix
-    samples_1 : list of str
-        Sample identities for group 1 (at least 3)
-    samples_2 : list of str
-        Sample identities for group 2 (at least 3)
-    sample_key : str
-        Column in adata.obs containing sample identities
-    features : list of str, optional
-        Genes to analyze
-    t_test : bool
-        Use unweighted t-test for sample comparison
-    min_pct : float
-        Minimum expression fraction threshold
-    fc_thr : float
-        Fold-change threshold
-    max_pval : float
-        Maximum p-value threshold
-    icc : str or float
-        ICC method for within-sample weighting
-    df_correction : bool
-        Apply degrees of freedom correction
-    n_cores : int
-        Number of CPU cores
-        
-    Returns
-    -------
-    dict
-        Dictionary with 'DGE' (results DataFrame), 'Sstats' (sample statistics), 
-        and 'parameters' (analysis parameters)
-    """
-    if len(samples_1) < 3 or len(samples_2) < 3:
-        raise ValueError("At least 3 samples per group are required")
-    
-    # Calculate weighted averages within samples
-    print("Calculating weighted averages within samples...")
-    adata_av = cnt_av(adata, sample_key, features, icc)
-    
-    # Generate sample matrix
-    print("Generating sample matrix...")
-    sample_matrix = create_sample_matrix(adata_av, samples_1, samples_2)
-    
-    # Perform weighted t-test on sample matrix
-    print("Performing multi-sample analysis...")
-    output = wt_multisample(
-        sample_matrix, features, t_test, min_pct, fc_thr, max_pval, df_correction
-    )
-    
-    # Create parameters dictionary
-    params = {
-        't_test': str(t_test),
-        'min_pct': str(min_pct),
-        'fc_thr': str(fc_thr),
-        'max_pval': str(max_pval),
-        'icc': str(icc),
-        'df_correction': str(df_correction),
-        'n_cores': str(n_cores)
-    }
-    
-    return {
-        'DGE': output['DGE'],
-        'Sstats': output['Sstats'],
-        'parameters': params
-    }
-
-
-def cnt_av(
-    adata,
-    sample_key: str = 'sample',
-    features: Optional[List[str]] = None,
-    icc: Union[str, float] = 'i'
-) -> Dict:
-    """
-    Calculate weighted average counts and variances for each sample.
-    
-    Parameters
-    ----------
-    adata : AnnData
-        Annotated data matrix
-    sample_key : str
-        Column in adata.obs containing sample identities
-    features : list of str, optional
-        Genes to analyze
-    icc : str or float
-        ICC method
-        
-    Returns
-    -------
-    dict
-        Dictionary with 'AV_data' (per-sample statistics) and 'Sstats' (sample summaries)
-    """
-    if features is None:
-        gene_list = adata.var_names.tolist()
-    else:
-        gene_list = features
-    
-    samples = adata.obs[sample_key].unique()
-    Ns = len(samples)
-    
-    if Ns < 6:
-        raise ValueError("At least 6 samples with different identities are required")
-    
-    # Get count matrix
-    if adata.raw is not None:
-        X = adata.raw.X
-        var_names = adata.raw.var_names
-    else:
-        X = adata.X
-        var_names = adata.var_names
-    
-    # Create gene to index mapping
-    gene_to_idx = {gene: idx for idx, gene in enumerate(var_names) if gene in gene_list}
-    gene_list_filtered = [g for g in gene_list if g in gene_to_idx]
-    Ng = len(gene_list_filtered)
-    
-    # Initialize storage
-    av_data = {}
-    sstats = pd.DataFrame(
-        index=['N.cells', 'N.counts', 'Counts/cell'],
-        columns=samples
-    )
-    
-    print("Averaging counts and calculating variance for each sample:")
-    
-    for sample in tqdm(samples):
-        # Subset data for this sample
-        mask = (adata.obs[sample_key] == sample).values
-        Ci = X[mask, :]
-        
-        # Calculate total counts per cell
-        if sp.issparse(Ci):
-            Ni = np.array(Ci.sum(axis=1)).flatten()
-        else:
-            Ni = Ci.sum(axis=1)
-        
-        Nc = Ci.shape[0]
-        
-        # Record sample statistics
-        sstats.loc['N.cells', sample] = Nc
-        sstats.loc['N.counts', sample] = Ni.sum()
-        sstats.loc['Counts/cell', sample] = Ni.sum() / Nc
-        
-        # Normalize counts (% UMI)
-        if sp.issparse(Ci):
-            Xi_normalized = Ci.multiply(100 / Ni[:, np.newaxis])
-        else:
-            Xi_normalized = 100 * Ci / Ni[:, np.newaxis]
-        
-        # Calculate statistics for each gene
-        AV = np.zeros(Ng)
-        VAR = np.zeros(Ng)
-        PCT = np.zeros(Ng)
-        
-        for i, gene in enumerate(gene_list_filtered):
-            idx = gene_to_idx[gene]
-            
-            # Get counts for this gene
-            if sp.issparse(Ci):
-                h = Ci[:, idx].toarray().flatten()
-                x = Xi_normalized[:, idx].toarray().flatten()
-            else:
-                h = Ci[:, idx]
-                x = Xi_normalized[:, idx]
-            
-            # Calculate weights
-            w = icc_weight(h, Ni, icc)
-            
-            # Weighted average
-            AV[i] = (x * w).sum()
-            
-            # Variance
-            if AV[i] != 0:
-                VAR[i] = (w**2 * (x - AV[i])**2).sum() / (1 - (w**2).sum())
-            else:
-                VAR[i] = 1 / Ni.sum()**2
-            
-            # Expression fraction
-            PCT[i] = (h != 0).sum() / Nc
-        
-        # Store results
-        av_data[sample] = pd.DataFrame({
-            'AV': AV,
-            'VAR': VAR,
-            'PCT': PCT
-        }, index=gene_list_filtered)
-    
-    return {'AV_data': av_data, 'Sstats': sstats}
-
-
-def create_sample_matrix(
-    av_dict: Dict,
-    samples_1: List[str],
-    samples_2: List[str]
-) -> Dict:
-    """
-    Create sample matrices from averaged data.
-    
-    Parameters
-    ----------
-    av_dict : dict
-        Output from cnt_av function
-    samples_1 : list of str
-        Sample names for group 1
-    samples_2 : list of str
-        Sample names for group 2
-        
-    Returns
-    -------
-    dict
-        Dictionary containing matrices for both groups and sample statistics
-    """
-    N_1 = len(samples_1)
-    N_2 = len(samples_2)
-    
-    if N_1 < 3 or N_2 < 3:
-        raise ValueError("At least 3 samples per group are required")
-    
-    av_data = av_dict['AV_data']
-    sstats = av_dict['Sstats']
-    
-    # Get gene list from first sample
-    gene_list = av_data[samples_1[0]].index.tolist()
-    Ng = len(gene_list)
-    
-    # Initialize matrices
-    AV_1 = pd.DataFrame(index=gene_list, columns=samples_1)
-    VAR_1 = pd.DataFrame(index=gene_list, columns=samples_1)
-    PCT_1 = pd.DataFrame(index=gene_list, columns=samples_1)
-    
-    AV_2 = pd.DataFrame(index=gene_list, columns=samples_2)
-    VAR_2 = pd.DataFrame(index=gene_list, columns=samples_2)
-    PCT_2 = pd.DataFrame(index=gene_list, columns=samples_2)
-    
-    print("Generating sample matrix:")
-    
-    # Fill matrices for group 1
-    for sample in tqdm(samples_1, desc="Group 1"):
-        AV_1[sample] = av_data[sample]['AV']
-        VAR_1[sample] = av_data[sample]['VAR']
-        PCT_1[sample] = av_data[sample]['PCT']
-    
-    # Fill matrices for group 2
-    for sample in tqdm(samples_2, desc="Group 2"):
-        AV_2[sample] = av_data[sample]['AV']
-        VAR_2[sample] = av_data[sample]['VAR']
-        PCT_2[sample] = av_data[sample]['PCT']
-    
-    return {
-        'AV_1': AV_1,
-        'VAR_1': VAR_1,
-        'PCT_1': PCT_1,
-        'AV_2': AV_2,
-        'VAR_2': VAR_2,
-        'PCT_2': PCT_2,
-        'Sstats': sstats
-    }
-
-
-def iter_var(av: np.ndarray, va: np.ndarray) -> np.ndarray:
-    """
-    Calculate weights for variance vectors using iterative approach.
-    
-    Parameters
-    ----------
-    av : array
-        Average expression values
-    va : array
-        Variance values
-        
-    Returns
-    -------
-    array
-        Normalized weights
-    """
-    Nv = len(va)
-    
-    if len(av) != Nv:
-        raise ValueError("Unequal lengths of average and variance vectors")
-    
-    if Nv < 3:
-        raise ValueError("At least 3 samples are required")
-    
-    x = av
-    Vari = va
-    
-    # Initial calculations
-    inv_Vari = 1 / Vari
-    sum_inv_Vari = inv_Vari.sum()
-    VarT0 = 1 / sum_inv_Vari
-    w0 = inv_Vari / sum_inv_Vari
-    w0_sq_sum = (w0**2).sum()
-    x0 = (x * w0).sum()
-    VarE0 = (w0**2 * (x - x0)**2).sum() / (1 - w0_sq_sum)
-    
-    if VarE0 <= VarT0:
-        Vp = 0
-    else:
-        def f(Vp, x, Vari):
-            wprop = 1 / (Vari + Vp)
-            sum_wprop = wprop.sum()
-            VarT = 1 / sum_wprop
-            w = wprop / sum_wprop
-            x1 = (x * w).sum()
-            w_sq = w**2
-            VarE = (w_sq * (x - x1)**2).sum() / (1 - w_sq.sum())
-            return VarE - VarT
-        
-        try:
-            Vp1 = Vari.max()
-            Vp = brentq(f, 0, Vp1, args=(x, Vari), xtol=Vari.min() * 1e-4)
-            Vp = max(Vp, 0)
-        except ValueError:
-            Vp = 0
-    
-    wprop_final = 1 / (Vari + Vp)
-    return wprop_final / wprop_final.sum()
-
-
-def wt_multisample(
-    sample_matrix: Dict,
-    features: Optional[List[str]] = None,
-    t_test: bool = False,
-    min_pct: float = 0.03,
-    fc_thr: float = 1.0,
-    max_pval: float = 1.0,
-    df_correction: bool = False
-) -> Dict:
-    """
-    Perform weighted t-test on multiple samples.
-    
-    Parameters
-    ----------
-    sample_matrix : dict
-        Output from create_sample_matrix
-    features : list of str, optional
-        Genes to analyze
-    t_test : bool
-        Use unweighted t-test
-    min_pct : float
-        Minimum expression fraction
-    fc_thr : float
-        Fold-change threshold
-    max_pval : float
-        Maximum p-value
-    df_correction : bool
-        Apply DF correction
-        
-    Returns
-    -------
-    dict
-        Dictionary with 'DGE' and 'Sstats'
-    """
-    AV1 = sample_matrix['AV_1']
-    var1 = sample_matrix['VAR_1']
-    AV2 = sample_matrix['AV_2']
-    var2 = sample_matrix['VAR_2']
-    pct1 = sample_matrix['PCT_1']
-    pct2 = sample_matrix['PCT_2']
-    sstats = sample_matrix['Sstats']
-    
-    if features is None:
-        gene_list = AV1.index.tolist()
-    else:
-        gene_list = features
-    
-    results = []
-    
-    print("Performing weighted t-test:")
-    
-    for gene in tqdm(gene_list):
-        if gene not in AV1.index:
-            continue
-        
-        Xi1 = AV1.loc[gene].values
-        Xi2 = AV2.loc[gene].values
-        VARi1 = var1.loc[gene].values
-        VARi2 = var2.loc[gene].values
-        PCTi1 = pct1.loc[gene].values
-        PCTi2 = pct2.loc[gene].values
-        
-        N1 = len(Xi1)
-        N2 = len(Xi2)
-        
-        if N1 >= 3 and N2 >= 3 and (PCTi1.mean() >= min_pct or PCTi2.mean() >= min_pct):
-            # Calculate weights
-            if t_test:
-                wi_1 = np.ones(N1) / N1
-                wi_2 = np.ones(N2) / N2
-            else:
-                wi_1 = iter_var(Xi1, VARi1)
-                wi_2 = iter_var(Xi2, VARi2)
-            
-            # Weighted averages
-            Xi1av = (Xi1 * wi_1).sum()
-            Xi2av = (Xi2 * wi_2).sum()
-            
-            # Standard deviations
-            Xi1sd = np.sqrt((wi_1**2 * (Xi1 - Xi1av)**2).sum() / (1 - (wi_1**2).sum()))
-            Xi2sd = np.sqrt((wi_2**2 * (Xi2 - Xi2av)**2).sum() / (1 - (wi_2**2).sum()))
-            
-            # Fold change
-            fc = Xi1av / Xi2av if Xi2av != 0 else np.nan
-            
-            if not np.isnan(fc) and (fc >= fc_thr or fc <= 1/fc_thr):
-                # Weighted t-test
-                if df_correction:
-                    p_value = alt_wttest2(Xi1, Xi2, wi_1, wi_2)
-                else:
-                    p_value = alt_wttest(Xi1, Xi2, wi_1, wi_2)
-                
-                if p_value <= max_pval:
-                    results.append({
-                        'gene': gene,
-                        'log2FC': np.log2(fc),
-                        'p.value': p_value,
-                        'Wtd.%UMI.1': Xi1av,
-                        'Sd.%UMI.1': Xi1sd,
-                        'Av.min.pct.1': PCTi1.mean(),
-                        'Wtd.%UMI.2': Xi2av,
-                        'Sd.%UMI.2': Xi2sd,
-                        'Av.min.pct.2': PCTi2.mean()
-                    })
-    
-    if len(results) == 0:
-        dge_df = pd.DataFrame(columns=[
-            'log2FC', 'p.value', 'Wtd.%UMI.1', 'Sd.%UMI.1', 'Av.min.pct.1',
-            'Wtd.%UMI.2', 'Sd.%UMI.2', 'Av.min.pct.2'
-        ])
-    else:
-        dge_df = pd.DataFrame(results)
-        dge_df.set_index('gene', inplace=True)
-    
-    return {'DGE': dge_df, 'Sstats': sstats}
 
 
 # Convenience functions for scanpy integration
