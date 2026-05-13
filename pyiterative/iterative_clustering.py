@@ -35,7 +35,7 @@ except ImportError:
     _CUPY_AVAILABLE = False
     _GPU_CACHE = {}
 
-def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=4, min_cluster_size=4, batch_key=None, n_cores=None, DE_batch_size=2048, icc_gpu=False, min_pval=0.05, pct_diff=0.7):
+def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=4, min_cluster_size=4, batch_key=None, n_cores=None, DE_batch_size=2048, icc_gpu=False, min_pval=0.05, pct_diff=0.7, seed=42):
     """
     Wrapper function to perform iterative clustering using scVI and Leiden algorithm.
     Args:
@@ -54,6 +54,7 @@ def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_lo
         icc_gpu: Use GPU for ICC weight computation in dge_2samples (default: False). Set to False to force CPU.
         min_pval: Minimum BH-adjusted p-value for a gene to be considered differentially expressed (default: 0.05).
         pct_diff: Minimum percentage difference threshold for DE genes. If pct_1 > pct_2: pct_diff = (pct_1-pct_2)/pct_1. If pct_2 > pct_1: pct_diff = (pct_2-pct_1)/pct_2 (default: 0.7).
+        seed: Random seed for reproducibility (default: 42).
     Returns:
         adata: AnnData object with updated clustering in adata.obs['leiden'].
     """
@@ -65,7 +66,7 @@ def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_lo
     previous_num_clusters = 1
     # Iterative loop
     for i in range(num_iterations):
-        adata = Clustering_Iteration(adata, ndims=ndims, min_pct=min_pct, min_log2_fc=min_log2_fc, batch_size=batch_size, min_score=min_score, min_de_genes=min_de_genes, min_cluster_size=min_cluster_size, batch_key=batch_key, n_cores=n_cores, DE_batch_size=DE_batch_size, icc_gpu=icc_gpu, min_pval=min_pval, pct_diff=pct_diff)
+        adata = Clustering_Iteration(adata, ndims=ndims, min_pct=min_pct, min_log2_fc=min_log2_fc, batch_size=batch_size, min_score=min_score, min_de_genes=min_de_genes, min_cluster_size=min_cluster_size, batch_key=batch_key, n_cores=n_cores, DE_batch_size=DE_batch_size, icc_gpu=icc_gpu, min_pval=min_pval, pct_diff=pct_diff, seed=seed)
         if len(adata.obs['leiden'].cat.categories) == previous_num_clusters:
             break
         previous_num_clusters = len(adata.obs['leiden'].cat.categories)
@@ -101,7 +102,7 @@ def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_lo
         adata_hvg = adata[:, hvg_genes].copy()
         ccd_model = ccd.Concord(adata=adata_hvg, input_feature=hvg_genes, domain_key=batch_key, 
                                 device=_DEVICE, preload_dense=False, batch_size=batch_size, latent_dim=ndims,
-                                encoder_dims=[int(2**(np.floor(np.sqrt(ndims))+1))], save_dir=None)
+                                encoder_dims=[int(2**(np.floor(np.sqrt(ndims))+1))], save_dir=None, seed=seed)
         ccd_model.fit_transform(output_key='Concord', save_model=False)
         final_centroids = Find_Centroids(adata_hvg, cluster_key='leiden', embedding_key='Concord', ndims=ndims)
         
@@ -221,7 +222,7 @@ def Find_Centroids(adata, cluster_key='leiden', embedding_key='Concord', ndims=3
         centroids_df = centroids_df.dropna()
         
     return centroids_df.values
-def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=1, min_cluster_size=4, batch_key=None, n_cores=None, DE_batch_size=2048, icc_gpu=True, min_pval=0.05, pct_diff=0.7):
+def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=1, min_cluster_size=4, batch_key=None, n_cores=None, DE_batch_size=2048, icc_gpu=True, min_pval=0.05, pct_diff=0.7, seed=42):
     """
     Performs one iteration of clustering and merging.
     Args:
@@ -239,6 +240,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
          icc_gpu: Use GPU for ICC weight computation in dge_2samples. Set to False to force CPU.
          min_pval: Minimum BH-adjusted p-value for a gene to be considered differentially expressed.
          pct_diff: Minimum percentage difference threshold for DE genes. If pct_1 > pct_2: pct_diff = (pct_1-pct_2)/pct_1. If pct_2 > pct_1: pct_diff = (pct_2-pct_1)/pct_2 (default: 0.7).
+         seed: Random seed for reproducibility.
     Returns:
          adata: AnnData object with updated clustering in adata.obs['leiden'].
     """
@@ -292,7 +294,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
         
         ccd_model = ccd.Concord(adata=cluster_adata_hvg, input_feature=hvg_genes, domain_key=batch_key, 
                                 device=_DEVICE, preload_dense=False, batch_size=effective_batch_size, latent_dim=ndims,
-                                encoder_dims=[int(2**(np.floor(np.sqrt(ndims))+1))], save_dir=None) # Use encoder_dims = 2^(floor(sqrt(ndims))+1)
+                                encoder_dims=[int(2**(np.floor(np.sqrt(ndims))+1))], save_dir=None, seed=seed) # Use encoder_dims = 2^(floor(sqrt(ndims))+1)
         
         try:
             ccd_model.fit_transform(output_key='Concord', save_model=False)
@@ -308,7 +310,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
         else:
             k = 20
         
-        idx, distance = NNDescent(cluster_adata.obsm['Concord'][:, :ndims], n_neighbors=k).neighbor_graph
+        idx, distance = NNDescent(cluster_adata.obsm['Concord'][:, :ndims], n_neighbors=k, random_state=seed).neighbor_graph
         # Drop self from kNN
         idx = idx[:, 1:]
         n_cells = idx.shape[0]
@@ -342,7 +344,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
         g = ig.Graph(n=cluster_adata.n_obs, edges=list(zip(sources, targets)), 
                      edge_attrs={'weight': weights}, directed=False)
         # Leiden clustering
-        part = leidenalg.find_partition(g, leidenalg.RBConfigurationVertexPartition, resolution_parameter=1)
+        part = leidenalg.find_partition(g, leidenalg.RBConfigurationVertexPartition, resolution_parameter=1, seed=seed)
         cluster_adata.obs['leiden'] = [str(c) for c in part.membership]
         cluster_adata.obs['leiden'] = cluster_adata.obs['leiden'].astype('category')
         
