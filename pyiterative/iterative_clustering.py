@@ -35,7 +35,77 @@ except ImportError:
     _CUPY_AVAILABLE = False
     _GPU_CACHE = {}
 
-def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=4, min_cluster_size=4, batch_key=None, n_cores=None, DE_batch_size=2048, icc_gpu=False, min_pval=0.05, pct_diff=0.7, seed=42):
+DEFAULT_COUNTS_LAYER = 'counts'
+
+
+def _counts_layer_or_none(adata, counts_layer=DEFAULT_COUNTS_LAYER):
+    if counts_layer is not None and counts_layer in adata.layers:
+        return counts_layer
+    return None
+
+
+def _ensure_counts_layer(adata, counts_layer=DEFAULT_COUNTS_LAYER):
+    if counts_layer is not None and counts_layer not in adata.layers:
+        adata.layers[counts_layer] = adata.X.copy()
+
+
+def _set_x_to_counts(adata, counts_layer=DEFAULT_COUNTS_LAYER):
+    layer = _counts_layer_or_none(adata, counts_layer)
+    if layer is not None:
+        adata.X = adata.layers[layer].copy()
+
+
+def _get_count_matrix(adata, counts_layer=DEFAULT_COUNTS_LAYER):
+    layer = _counts_layer_or_none(adata, counts_layer)
+    if layer is not None:
+        return adata.layers[layer], adata.var_names
+    if adata.raw is not None:
+        return adata.raw.X, adata.raw.var_names
+    return adata.X, adata.var_names
+
+
+def _run_hvg(adata, n_top_genes, counts_layer=DEFAULT_COUNTS_LAYER, x_is_log_normalized=False, context=None):
+    hvg_layer = _counts_layer_or_none(adata, counts_layer)
+    hvg_kwargs = {
+        'n_top_genes': n_top_genes,
+        'subset': False,
+        'flavor': 'seurat_v3',
+        'span': 0.5
+    }
+    if hvg_layer is not None:
+        hvg_kwargs['layer'] = hvg_layer
+    
+    try:
+        sc.pp.highly_variable_genes(adata, **hvg_kwargs)
+    except (ValueError, RuntimeError) as e:
+        if 'Extrapolation not allowed' in str(e):
+            hvg_kwargs['span'] = 1.0
+            try:
+                sc.pp.highly_variable_genes(adata, **hvg_kwargs)
+            except Exception:
+                if context is not None:
+                    print(f"Warning: seurat_v3 HVG failed for {context} ({str(e)}), using seurat flavor instead")
+                _run_seurat_hvg_fallback(adata, n_top_genes, counts_layer, x_is_log_normalized)
+        else:
+            if context is not None:
+                print(f"Warning: seurat_v3 HVG failed for {context} ({str(e)}), using seurat flavor instead")
+            _run_seurat_hvg_fallback(adata, n_top_genes, counts_layer, x_is_log_normalized)
+
+
+def _run_seurat_hvg_fallback(adata, n_top_genes, counts_layer=DEFAULT_COUNTS_LAYER, x_is_log_normalized=False):
+    if x_is_log_normalized:
+        sc.pp.highly_variable_genes(adata, n_top_genes=n_top_genes, subset=False, flavor='seurat')
+        return
+    
+    hvg_adata = adata.copy()
+    _set_x_to_counts(hvg_adata, counts_layer)
+    sc.pp.normalize_total(hvg_adata, target_sum=1e4)
+    sc.pp.log1p(hvg_adata)
+    sc.pp.highly_variable_genes(hvg_adata, n_top_genes=n_top_genes, subset=False, flavor='seurat')
+    adata.var['highly_variable'] = hvg_adata.var['highly_variable'].values
+
+
+def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=4, min_cluster_size=4, batch_key=None, n_cores=None, DE_batch_size=2048, icc_gpu=False, min_pval=0.05, pct_diff=0.7, seed=42, counts_layer=DEFAULT_COUNTS_LAYER):
     """
     Wrapper function to perform iterative clustering using scVI and Leiden algorithm.
     Args:
