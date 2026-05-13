@@ -1,4 +1,5 @@
 import scanpy as sc
+import anndata as ad
 import leidenalg
 import numpy as np
 import pandas as pd
@@ -15,27 +16,75 @@ from scipy.sparse import csr_matrix
 import igraph as ig
 import concord as ccd
 import torch
-import cupy as cp
+try:
+    import cupy as cp
+except Exception:
+    cp = None
 
 
 # Check for GPU availability
-_GPU_AVAILABLE = torch.cuda.is_available()
+try:
+    _GPU_AVAILABLE = torch.cuda.is_available()
+except Exception:
+    _GPU_AVAILABLE = False
 _DEVICE = torch.device('cuda' if _GPU_AVAILABLE else 'cpu')
 
 # Try to import CuPy for GPU acceleration
+_CUPY_AVAILABLE = False
+_GPU_CACHE = {}
 try:
-    _CUPY_AVAILABLE = cp.cuda.is_available()
+    _CUPY_AVAILABLE = cp is not None and cp.cuda.is_available()
     if _CUPY_AVAILABLE:
         # Enable pinned memory for faster CPU-GPU transfers
         cp.cuda.set_allocator(cp.cuda.MemoryPool(cp.cuda.malloc_managed).malloc)
         # Cache for persistent GPU data
         _GPU_CACHE = {'n_array': None, 'n_hash': None}
-except ImportError:
-    cp = None
+except Exception:
     _CUPY_AVAILABLE = False
-    _GPU_CACHE = {}
 
 DEFAULT_COUNTS_LAYER = 'counts'
+
+
+def _is_backed(adata):
+    return bool(getattr(adata, 'isbacked', False))
+
+
+def _obs_positions(index, n_obs):
+    if isinstance(index, slice):
+        return np.arange(n_obs)[index]
+    
+    index = np.asarray(index)
+    if index.dtype == bool:
+        return np.flatnonzero(index)
+    return index
+
+
+def _copy_adata(adata, backed_load_chunk_size=None, obs_idx=slice(None), var_idx=slice(None)):
+    if not _is_backed(adata):
+        return adata[obs_idx, var_idx].copy()
+    
+    if getattr(adata, 'is_view', False):
+        return adata.to_memory()[obs_idx, var_idx].copy()
+    
+    if backed_load_chunk_size is None:
+        return adata[obs_idx, var_idx].to_memory()
+    
+    if backed_load_chunk_size <= 0:
+        raise ValueError("backed_load_chunk_size must be a positive integer or None")
+    
+    obs_positions = _obs_positions(obs_idx, adata.n_obs)
+    chunks = []
+    for start in range(0, len(obs_positions), backed_load_chunk_size):
+        end = min(start + backed_load_chunk_size, len(obs_positions))
+        chunks.append(adata[obs_positions[start:end], var_idx].to_memory())
+    
+    if not chunks:
+        return adata.to_memory()
+    
+    if len(chunks) == 1:
+        return chunks[0]
+    
+    return ad.concat(chunks, axis=0, join='outer', merge='same', uns_merge='same')
 
 
 def _counts_layer_or_none(adata, counts_layer=DEFAULT_COUNTS_LAYER):
@@ -79,15 +128,21 @@ def _get_count_matrix(adata, counts_layer=DEFAULT_COUNTS_LAYER):
     return adata.X, adata.var_names
 
 
-def _run_hvg(adata, n_top_genes, counts_layer=DEFAULT_COUNTS_LAYER, x_is_log_normalized=False, context=None):
+def _run_hvg(adata, n_top_genes, counts_layer=DEFAULT_COUNTS_LAYER, x_is_log_normalized=False, context=None, backed_load_chunk_size=None):
     hvg_layer = _counts_layer_or_none(adata, counts_layer)
     hvg_adata = None
     hvg_target = adata
     
+    if _is_backed(adata):
+        hvg_adata = _copy_adata(adata, backed_load_chunk_size=backed_load_chunk_size)
+        hvg_target = hvg_adata
+        hvg_layer = _counts_layer_or_none(hvg_target, counts_layer)
+    
     if hvg_layer is None:
-        raw_counts = _raw_counts_for_current_vars(adata)
+        raw_counts = _raw_counts_for_current_vars(hvg_target)
         if raw_counts is not None:
-            hvg_adata = adata.copy()
+            if hvg_adata is None:
+                hvg_adata = _copy_adata(hvg_target)
             hvg_adata.X = raw_counts.copy()
             hvg_target = hvg_adata
             x_is_log_normalized = False
@@ -126,7 +181,7 @@ def _run_seurat_hvg_fallback(adata, n_top_genes, counts_layer=DEFAULT_COUNTS_LAY
         sc.pp.highly_variable_genes(adata, n_top_genes=n_top_genes, subset=False, flavor='seurat')
         return
     
-    hvg_adata = adata.copy()
+    hvg_adata = _copy_adata(adata)
     _set_x_to_counts(hvg_adata, counts_layer)
     sc.pp.normalize_total(hvg_adata, target_sum=1e4)
     sc.pp.log1p(hvg_adata)
@@ -134,7 +189,39 @@ def _run_seurat_hvg_fallback(adata, n_top_genes, counts_layer=DEFAULT_COUNTS_LAY
     adata.var['highly_variable'] = hvg_adata.var['highly_variable'].values
 
 
-def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=4, min_cluster_size=4, batch_key=None, n_cores=None, DE_batch_size=2048, icc_gpu=False, min_pval=0.05, pct_diff=0.7, seed=42, counts_layer=DEFAULT_COUNTS_LAYER):
+def _resolve_concord_chunked(adata, concord_chunked=None, source_is_backed=False):
+    if concord_chunked is None:
+        return source_is_backed or _is_backed(adata)
+    return bool(concord_chunked)
+
+
+def _make_concord_model(adata, input_feature, batch_key, batch_size, ndims, seed, concord_chunked=None, concord_chunk_size=10000, source_is_backed=False):
+    use_chunked = _resolve_concord_chunked(adata, concord_chunked, source_is_backed=source_is_backed)
+    if use_chunked and concord_chunk_size <= 0:
+        raise ValueError("concord_chunk_size must be a positive integer")
+    
+    effective_batch_size = min(batch_size, adata.n_obs)
+    concord_kwargs = {
+        'adata': adata,
+        'input_feature': input_feature,
+        'domain_key': batch_key,
+        'device': _DEVICE,
+        'preload_dense': False,
+        'batch_size': effective_batch_size,
+        'latent_dim': ndims,
+        'encoder_dims': [int(2**(np.floor(np.sqrt(ndims))+1))],
+        'save_dir': None,
+        'seed': seed
+    }
+    
+    if use_chunked:
+        concord_kwargs['chunked'] = True
+        concord_kwargs['chunk_size'] = concord_chunk_size
+    
+    return ccd.Concord(**concord_kwargs)
+
+
+def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=4, min_cluster_size=4, batch_key=None, n_cores=None, DE_batch_size=2048, icc_gpu=False, min_pval=0.05, pct_diff=0.7, seed=42, counts_layer=DEFAULT_COUNTS_LAYER, concord_chunked=None, concord_chunk_size=10000, backed_load_chunk_size=None):
     """
     Wrapper function to perform iterative clustering using scVI and Leiden algorithm.
     Args:
@@ -155,18 +242,24 @@ def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_lo
         pct_diff: Minimum percentage difference threshold for DE genes. If pct_1 > pct_2: pct_diff = (pct_1-pct_2)/pct_1. If pct_2 > pct_1: pct_diff = (pct_2-pct_1)/pct_2 (default: 0.7).
         seed: Random seed for reproducibility (default: 42).
         counts_layer: Layer containing raw counts for HVG and DE analysis. If absent, falls back to .raw and then .X (default: 'counts').
+        concord_chunked: Whether to use CONCORD's chunked loader. If None, enabled when the source AnnData is backed/on disk.
+        concord_chunk_size: Number of cells per CONCORD chunk when chunked loading is enabled (default: 10000).
+        backed_load_chunk_size: Number of cells per chunk when materializing backed AnnData slices for pyIterative steps. If None, load slices at once.
     Returns:
         adata: AnnData object with updated clustering in adata.obs['leiden'].
     """
     if n_cores is None:
         n_cores = max(1, cpu_count() - 1)
+    source_is_backed = _is_backed(adata)
+    if source_is_backed:
+        print("Detected backed/on-disk AnnData. CONCORD chunked loading is enabled by default; pyIterative still materializes cluster slices for HVG, graph, and DE steps.")
     # Place all cells in a single initial cluster
     adata.obs['leiden']='1'
     adata.obs['leiden'] = adata.obs['leiden'].astype('category')
     previous_num_clusters = 1
     # Iterative loop
     for i in range(num_iterations):
-        adata = Clustering_Iteration(adata, ndims=ndims, min_pct=min_pct, min_log2_fc=min_log2_fc, batch_size=batch_size, min_score=min_score, min_de_genes=min_de_genes, min_cluster_size=min_cluster_size, batch_key=batch_key, n_cores=n_cores, DE_batch_size=DE_batch_size, icc_gpu=icc_gpu, min_pval=min_pval, pct_diff=pct_diff, seed=seed, counts_layer=counts_layer)
+        adata = Clustering_Iteration(adata, ndims=ndims, min_pct=min_pct, min_log2_fc=min_log2_fc, batch_size=batch_size, min_score=min_score, min_de_genes=min_de_genes, min_cluster_size=min_cluster_size, batch_key=batch_key, n_cores=n_cores, DE_batch_size=DE_batch_size, icc_gpu=icc_gpu, min_pval=min_pval, pct_diff=pct_diff, seed=seed, counts_layer=counts_layer, concord_chunked=concord_chunked, concord_chunk_size=concord_chunk_size, backed_load_chunk_size=backed_load_chunk_size)
         if len(adata.obs['leiden'].cat.categories) == previous_num_clusters:
             break
         previous_num_clusters = len(adata.obs['leiden'].cat.categories)
@@ -183,16 +276,16 @@ def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_lo
         
         # Calculate centroids for all final clusters in CONCORD space.
         # Keep the full adata count matrix untouched; normalize only the HVG subset used by CONCORD.
-        _run_hvg(adata, n_top_genes=2000, counts_layer=counts_layer, x_is_log_normalized=False, context='final validation')
+        _run_hvg(adata, n_top_genes=2000, counts_layer=counts_layer, x_is_log_normalized=False, context='final validation', backed_load_chunk_size=backed_load_chunk_size)
         hvg_genes = adata.var_names[adata.var['highly_variable']].tolist()
-        adata_hvg = adata[:, hvg_genes].copy()
+        adata_hvg = _copy_adata(adata, backed_load_chunk_size=backed_load_chunk_size, var_idx=hvg_genes)
         _ensure_counts_layer(adata_hvg, counts_layer)
         _set_x_to_counts(adata_hvg, counts_layer)
         sc.pp.normalize_total(adata_hvg, target_sum=1e4)
         sc.pp.log1p(adata_hvg)
-        ccd_model = ccd.Concord(adata=adata_hvg, input_feature=hvg_genes, domain_key=batch_key, 
-                                device=_DEVICE, preload_dense=False, batch_size=batch_size, latent_dim=ndims,
-                                encoder_dims=[int(2**(np.floor(np.sqrt(ndims))+1))], save_dir=None, seed=seed)
+        ccd_model = _make_concord_model(adata_hvg, hvg_genes, batch_key, batch_size, ndims, seed,
+                                        concord_chunked=concord_chunked, concord_chunk_size=concord_chunk_size,
+                                        source_is_backed=source_is_backed)
         ccd_model.fit_transform(output_key='Concord', save_model=False)
         final_centroids = Find_Centroids(adata_hvg, cluster_key='leiden', embedding_key='Concord', ndims=ndims)
         
@@ -312,7 +405,7 @@ def Find_Centroids(adata, cluster_key='leiden', embedding_key='Concord', ndims=3
         centroids_df = centroids_df.dropna()
         
     return centroids_df.values
-def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=1, min_cluster_size=4, batch_key=None, n_cores=None, DE_batch_size=2048, icc_gpu=True, min_pval=0.05, pct_diff=0.7, seed=42, counts_layer=DEFAULT_COUNTS_LAYER):
+def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=1, min_cluster_size=4, batch_key=None, n_cores=None, DE_batch_size=2048, icc_gpu=True, min_pval=0.05, pct_diff=0.7, seed=42, counts_layer=DEFAULT_COUNTS_LAYER, concord_chunked=None, concord_chunk_size=10000, backed_load_chunk_size=None):
     """
     Performs one iteration of clustering and merging.
     Args:
@@ -332,17 +425,21 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
          pct_diff: Minimum percentage difference threshold for DE genes. If pct_1 > pct_2: pct_diff = (pct_1-pct_2)/pct_1. If pct_2 > pct_1: pct_diff = (pct_2-pct_1)/pct_2 (default: 0.7).
          seed: Random seed for reproducibility.
          counts_layer: Layer containing raw counts for HVG and DE analysis. If absent, falls back to .raw and then .X.
+         concord_chunked: Whether to use CONCORD's chunked loader. If None, enabled when the source AnnData is backed/on disk.
+         concord_chunk_size: Number of cells per CONCORD chunk when chunked loading is enabled.
+         backed_load_chunk_size: Number of cells per chunk when materializing backed AnnData slices. If None, load slices at once.
     Returns:
          adata: AnnData object with updated clustering in adata.obs['leiden'].
     """
     if n_cores is None:
         n_cores = max(1, cpu_count() - 1)
     
+    source_is_backed = _is_backed(adata)
     clusters = adata.obs['leiden'].cat.categories.copy()
     
     for cluster in clusters:
         cluster_mask = (adata.obs['leiden'] == cluster).values
-        cluster_adata = adata[cluster_mask].copy()
+        cluster_adata = _copy_adata(adata, backed_load_chunk_size=backed_load_chunk_size, obs_idx=cluster_mask)
         _ensure_counts_layer(cluster_adata, counts_layer)
         _set_x_to_counts(cluster_adata, counts_layer)
         sc.pp.normalize_total(cluster_adata, target_sum=1e4)
@@ -350,7 +447,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
         
         # Try to find highly variable genes with error handling
         n_genes = min(2000, cluster_adata.n_vars)
-        _run_hvg(cluster_adata, n_top_genes=n_genes, counts_layer=counts_layer, x_is_log_normalized=True, context=f'cluster {cluster}')
+        _run_hvg(cluster_adata, n_top_genes=n_genes, counts_layer=counts_layer, x_is_log_normalized=True, context=f'cluster {cluster}', backed_load_chunk_size=backed_load_chunk_size)
         
         # Subset to highly variable genes for CONCORD
         hvg_genes = cluster_adata.var_names[cluster_adata.var['highly_variable']].tolist()
@@ -365,14 +462,11 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
             print(f"Warning: Cluster {cluster} has {cluster_adata.n_obs} cells (=< {min_cluster_size}), skipping")
             continue
             
-        cluster_adata_hvg = cluster_adata[:, hvg_genes].copy()
+        cluster_adata_hvg = _copy_adata(cluster_adata, backed_load_chunk_size=backed_load_chunk_size, var_idx=hvg_genes)
         
-        # Adjust batch_size if it's larger than the number of observations
-        effective_batch_size = min(batch_size, cluster_adata_hvg.n_obs)
-        
-        ccd_model = ccd.Concord(adata=cluster_adata_hvg, input_feature=hvg_genes, domain_key=batch_key, 
-                                device=_DEVICE, preload_dense=False, batch_size=effective_batch_size, latent_dim=ndims,
-                                encoder_dims=[int(2**(np.floor(np.sqrt(ndims))+1))], save_dir=None, seed=seed) # Use encoder_dims = 2^(floor(sqrt(ndims))+1)
+        ccd_model = _make_concord_model(cluster_adata_hvg, hvg_genes, batch_key, batch_size, ndims, seed,
+                                        concord_chunked=concord_chunked, concord_chunk_size=concord_chunk_size,
+                                        source_is_backed=source_is_backed)
         
         try:
             ccd_model.fit_transform(output_key='Concord', save_model=False)

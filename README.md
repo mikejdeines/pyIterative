@@ -31,6 +31,11 @@ Raw counts do not need to be stored in `adata.raw`. By default, pyIterative look
 `adata.layers["counts"]` for HVG selection and DE testing, then falls back to `adata.raw.X` and finally
 `adata.X`. If your count layer uses another name, pass it with `counts_layer="your_layer"`.
 
+CONCORD can run with its chunked loader for backed/on-disk AnnData. pyIterative enables this automatically
+when `adata.isbacked` is true, or you can set `concord_chunked=True` and control the chunk size with
+`concord_chunk_size`. Scanpy HVG, graph construction, and DE steps still materialize cluster slices; for
+backed AnnData these reads can be staged with `backed_load_chunk_size`.
+
 If you find this package useful, please cite the following papers:
 Margolin, G. et al. Cell Reports Methods 0, (2026)
 Zhu, Q. et al. Nat Biotechnol 1–15 (2026)
