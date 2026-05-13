@@ -27,6 +27,10 @@ Clustering iterations are performed until no new clusters are found.
 
 After the final iteration, all clusters are checked to make sure they are seperable by DE score.
 
+Raw counts do not need to be stored in `adata.raw`. By default, pyIterative looks for raw counts in
+`adata.layers["counts"]` for HVG selection and DE testing, then falls back to `adata.raw.X` and finally
+`adata.X`. If your count layer uses another name, pass it with `counts_layer="your_layer"`.
+
 If you find this package useful, please cite the following papers:
 Margolin, G. et al. Cell Reports Methods 0, (2026)
 Zhu, Q. et al. Nat Biotechnol 1–15 (2026)

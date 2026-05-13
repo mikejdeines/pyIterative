@@ -44,15 +44,30 @@ def _counts_layer_or_none(adata, counts_layer=DEFAULT_COUNTS_LAYER):
     return None
 
 
+def _raw_counts_for_current_vars(adata):
+    if adata.raw is None:
+        return None
+    try:
+        return adata.raw[:, adata.var_names.tolist()].X
+    except (KeyError, ValueError, IndexError):
+        return None
+
+
 def _ensure_counts_layer(adata, counts_layer=DEFAULT_COUNTS_LAYER):
     if counts_layer is not None and counts_layer not in adata.layers:
-        adata.layers[counts_layer] = adata.X.copy()
+        raw_counts = _raw_counts_for_current_vars(adata)
+        adata.layers[counts_layer] = raw_counts.copy() if raw_counts is not None else adata.X.copy()
 
 
 def _set_x_to_counts(adata, counts_layer=DEFAULT_COUNTS_LAYER):
     layer = _counts_layer_or_none(adata, counts_layer)
     if layer is not None:
         adata.X = adata.layers[layer].copy()
+        return
+    
+    raw_counts = _raw_counts_for_current_vars(adata)
+    if raw_counts is not None:
+        adata.X = raw_counts.copy()
 
 
 def _get_count_matrix(adata, counts_layer=DEFAULT_COUNTS_LAYER):
@@ -66,6 +81,17 @@ def _get_count_matrix(adata, counts_layer=DEFAULT_COUNTS_LAYER):
 
 def _run_hvg(adata, n_top_genes, counts_layer=DEFAULT_COUNTS_LAYER, x_is_log_normalized=False, context=None):
     hvg_layer = _counts_layer_or_none(adata, counts_layer)
+    hvg_adata = None
+    hvg_target = adata
+    
+    if hvg_layer is None:
+        raw_counts = _raw_counts_for_current_vars(adata)
+        if raw_counts is not None:
+            hvg_adata = adata.copy()
+            hvg_adata.X = raw_counts.copy()
+            hvg_target = hvg_adata
+            x_is_log_normalized = False
+    
     hvg_kwargs = {
         'n_top_genes': n_top_genes,
         'subset': False,
@@ -76,20 +102,23 @@ def _run_hvg(adata, n_top_genes, counts_layer=DEFAULT_COUNTS_LAYER, x_is_log_nor
         hvg_kwargs['layer'] = hvg_layer
     
     try:
-        sc.pp.highly_variable_genes(adata, **hvg_kwargs)
+        sc.pp.highly_variable_genes(hvg_target, **hvg_kwargs)
     except (ValueError, RuntimeError) as e:
         if 'Extrapolation not allowed' in str(e):
             hvg_kwargs['span'] = 1.0
             try:
-                sc.pp.highly_variable_genes(adata, **hvg_kwargs)
+                sc.pp.highly_variable_genes(hvg_target, **hvg_kwargs)
             except Exception:
                 if context is not None:
                     print(f"Warning: seurat_v3 HVG failed for {context} ({str(e)}), using seurat flavor instead")
-                _run_seurat_hvg_fallback(adata, n_top_genes, counts_layer, x_is_log_normalized)
+                _run_seurat_hvg_fallback(hvg_target, n_top_genes, counts_layer, x_is_log_normalized)
         else:
             if context is not None:
                 print(f"Warning: seurat_v3 HVG failed for {context} ({str(e)}), using seurat flavor instead")
-            _run_seurat_hvg_fallback(adata, n_top_genes, counts_layer, x_is_log_normalized)
+            _run_seurat_hvg_fallback(hvg_target, n_top_genes, counts_layer, x_is_log_normalized)
+    
+    if hvg_adata is not None:
+        adata.var['highly_variable'] = hvg_adata.var['highly_variable'].values
 
 
 def _run_seurat_hvg_fallback(adata, n_top_genes, counts_layer=DEFAULT_COUNTS_LAYER, x_is_log_normalized=False):
@@ -125,6 +154,7 @@ def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_lo
         min_pval: Minimum BH-adjusted p-value for a gene to be considered differentially expressed (default: 0.05).
         pct_diff: Minimum percentage difference threshold for DE genes. If pct_1 > pct_2: pct_diff = (pct_1-pct_2)/pct_1. If pct_2 > pct_1: pct_diff = (pct_2-pct_1)/pct_2 (default: 0.7).
         seed: Random seed for reproducibility (default: 42).
+        counts_layer: Layer containing raw counts for HVG and DE analysis. If absent, falls back to .raw and then .X (default: 'counts').
     Returns:
         adata: AnnData object with updated clustering in adata.obs['leiden'].
     """
@@ -136,7 +166,7 @@ def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_lo
     previous_num_clusters = 1
     # Iterative loop
     for i in range(num_iterations):
-        adata = Clustering_Iteration(adata, ndims=ndims, min_pct=min_pct, min_log2_fc=min_log2_fc, batch_size=batch_size, min_score=min_score, min_de_genes=min_de_genes, min_cluster_size=min_cluster_size, batch_key=batch_key, n_cores=n_cores, DE_batch_size=DE_batch_size, icc_gpu=icc_gpu, min_pval=min_pval, pct_diff=pct_diff, seed=seed)
+        adata = Clustering_Iteration(adata, ndims=ndims, min_pct=min_pct, min_log2_fc=min_log2_fc, batch_size=batch_size, min_score=min_score, min_de_genes=min_de_genes, min_cluster_size=min_cluster_size, batch_key=batch_key, n_cores=n_cores, DE_batch_size=DE_batch_size, icc_gpu=icc_gpu, min_pval=min_pval, pct_diff=pct_diff, seed=seed, counts_layer=counts_layer)
         if len(adata.obs['leiden'].cat.categories) == previous_num_clusters:
             break
         previous_num_clusters = len(adata.obs['leiden'].cat.categories)
@@ -151,25 +181,15 @@ def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_lo
         if len(current_clusters) < 2:
             break
         
-        # Calculate centroids for all final clusters in CONCORD space
-        adata.layers['counts'] = adata.X.copy()
-        adata.raw = adata.copy()  # Ensure .raw is populated for DE analysis
-        sc.pp.normalize_total(adata, target_sum=1e4)
-        sc.pp.log1p(adata)
-        try:
-            sc.pp.highly_variable_genes(adata, n_top_genes=2000, subset=False, flavor='seurat_v3', layer='counts', span=0.5)
-        except ValueError as e:
-            if 'Extrapolation not allowed' in str(e):
-                # Fallback: use larger span or different method
-                try:
-                    sc.pp.highly_variable_genes(adata, n_top_genes=2000, subset=False, flavor='seurat_v3', layer='counts', span=1.0)
-                except:
-                    # Final fallback: use seurat method
-                    sc.pp.highly_variable_genes(adata, n_top_genes=2000, subset=False, flavor='seurat', layer='counts')
-            else:
-                raise
+        # Calculate centroids for all final clusters in CONCORD space.
+        # Keep the full adata count matrix untouched; normalize only the HVG subset used by CONCORD.
+        _run_hvg(adata, n_top_genes=2000, counts_layer=counts_layer, x_is_log_normalized=False, context='final validation')
         hvg_genes = adata.var_names[adata.var['highly_variable']].tolist()
         adata_hvg = adata[:, hvg_genes].copy()
+        _ensure_counts_layer(adata_hvg, counts_layer)
+        _set_x_to_counts(adata_hvg, counts_layer)
+        sc.pp.normalize_total(adata_hvg, target_sum=1e4)
+        sc.pp.log1p(adata_hvg)
         ccd_model = ccd.Concord(adata=adata_hvg, input_feature=hvg_genes, domain_key=batch_key, 
                                 device=_DEVICE, preload_dense=False, batch_size=batch_size, latent_dim=ndims,
                                 encoder_dims=[int(2**(np.floor(np.sqrt(ndims))+1))], save_dir=None, seed=seed)
@@ -200,7 +220,7 @@ def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_lo
                 continue
             
             # Calculate DE score between cluster and its nearest neighbor
-            de_score = DE_Score(adata, cluster, nearest_cluster, min_pct, min_log2_fc, min_de_genes, DE_batch_size=DE_batch_size, n_cores=n_cores, icc_gpu=icc_gpu, min_pval=min_pval, pct_diff=pct_diff)
+            de_score = DE_Score(adata, cluster, nearest_cluster, min_pct, min_log2_fc, min_de_genes, DE_batch_size=DE_batch_size, n_cores=n_cores, icc_gpu=icc_gpu, min_pval=min_pval, pct_diff=pct_diff, counts_layer=counts_layer)
             
             if de_score < min_score:
                 print(f"Final validation: merging cluster {cluster} ({cluster_size} cells) with nearest cluster {nearest_cluster} ({nearest_cluster_size} cells) - DE score: {de_score:.2f}")
@@ -292,7 +312,7 @@ def Find_Centroids(adata, cluster_key='leiden', embedding_key='Concord', ndims=3
         centroids_df = centroids_df.dropna()
         
     return centroids_df.values
-def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=1, min_cluster_size=4, batch_key=None, n_cores=None, DE_batch_size=2048, icc_gpu=True, min_pval=0.05, pct_diff=0.7, seed=42):
+def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=1, min_cluster_size=4, batch_key=None, n_cores=None, DE_batch_size=2048, icc_gpu=True, min_pval=0.05, pct_diff=0.7, seed=42, counts_layer=DEFAULT_COUNTS_LAYER):
     """
     Performs one iteration of clustering and merging.
     Args:
@@ -311,6 +331,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
          min_pval: Minimum BH-adjusted p-value for a gene to be considered differentially expressed.
          pct_diff: Minimum percentage difference threshold for DE genes. If pct_1 > pct_2: pct_diff = (pct_1-pct_2)/pct_1. If pct_2 > pct_1: pct_diff = (pct_2-pct_1)/pct_2 (default: 0.7).
          seed: Random seed for reproducibility.
+         counts_layer: Layer containing raw counts for HVG and DE analysis. If absent, falls back to .raw and then .X.
     Returns:
          adata: AnnData object with updated clustering in adata.obs['leiden'].
     """
@@ -322,27 +343,14 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
     for cluster in clusters:
         cluster_mask = (adata.obs['leiden'] == cluster).values
         cluster_adata = adata[cluster_mask].copy()
-        cluster_adata.layers['counts'] = cluster_adata.X.copy()
+        _ensure_counts_layer(cluster_adata, counts_layer)
+        _set_x_to_counts(cluster_adata, counts_layer)
         sc.pp.normalize_total(cluster_adata, target_sum=1e4)
         sc.pp.log1p(cluster_adata)
         
         # Try to find highly variable genes with error handling
-        try:
-            # Adjust n_top_genes if there are fewer genes available
-            n_genes = min(2000, cluster_adata.n_vars)
-            sc.pp.highly_variable_genes(cluster_adata, n_top_genes=n_genes, subset=False, flavor='seurat_v3', layer='counts',
-                                        span=0.5)
-        except (ValueError, RuntimeError) as e:
-            # If seurat_v3 fails (e.g., LOESS singularities or extrapolation error), try larger span first
-            if 'Extrapolation not allowed' in str(e):
-                try:
-                    sc.pp.highly_variable_genes(cluster_adata, n_top_genes=n_genes, subset=False, flavor='seurat_v3', layer='counts', span=1.0)
-                except:
-                    print(f"Warning: seurat_v3 HVG failed for cluster {cluster} ({str(e)}), using seurat flavor instead")
-                    sc.pp.highly_variable_genes(cluster_adata, n_top_genes=n_genes, subset=False, flavor='seurat')
-            else:
-                print(f"Warning: seurat_v3 HVG failed for cluster {cluster} ({str(e)}), using seurat flavor instead")
-                sc.pp.highly_variable_genes(cluster_adata, n_top_genes=n_genes, subset=False, flavor='seurat')
+        n_genes = min(2000, cluster_adata.n_vars)
+        _run_hvg(cluster_adata, n_top_genes=n_genes, counts_layer=counts_layer, x_is_log_normalized=True, context=f'cluster {cluster}')
         
         # Subset to highly variable genes for CONCORD
         hvg_genes = cluster_adata.var_names[cluster_adata.var['highly_variable']].tolist()
@@ -514,7 +522,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
                     continue
                     
                 # Perform differential expression analysis for larger clusters
-                bayes_de_score = DE_Score(cluster_adata, sub_cluster, closest_sub_cluster, min_pct, min_log2_fc, min_de_genes, n_cores=n_cores, DE_batch_size=DE_batch_size, icc_gpu=icc_gpu, min_pval=min_pval, pct_diff=pct_diff)
+                bayes_de_score = DE_Score(cluster_adata, sub_cluster, closest_sub_cluster, min_pct, min_log2_fc, min_de_genes, n_cores=n_cores, DE_batch_size=DE_batch_size, icc_gpu=icc_gpu, min_pval=min_pval, pct_diff=pct_diff, counts_layer=counts_layer)
                 
                 if bayes_de_score < min_score:
                     cluster_adata.obs.loc[cluster_adata.obs['leiden'] == closest_sub_cluster, 'leiden'] = sub_cluster
@@ -642,7 +650,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
     return adata
 
 
-def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes, DE_batch_size=2048, n_cores=None, icc_gpu=True, min_pval=0.05, pct_diff=0.7):
+def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes, DE_batch_size=2048, n_cores=None, icc_gpu=True, min_pval=0.05, pct_diff=0.7, counts_layer=DEFAULT_COUNTS_LAYER):
     """
     Calculate differential expression score between two identities.
     Args:
@@ -657,6 +665,7 @@ def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes, DE_bat
         icc_gpu: Use GPU for ICC weight computation in dge_2samples. Set to False to force CPU.
         min_pval: Minimum BH-adjusted p-value for a gene to be considered differentially expressed (default: 0.05).
         pct_diff: Minimum percentage difference threshold for DE genes. If pct_1 > pct_2: pct_diff = (pct_1-pct_2)/pct_1. If pct_2 > pct_1: pct_diff = (pct_2-pct_1)/pct_2 (default: 0.7).
+        counts_layer: Layer containing raw counts for DE analysis. If absent, falls back to .raw and then .X.
     Returns:
         de_score: Differential expression score sum(min(-log10(p_adj),20)).
     """
@@ -676,7 +685,8 @@ def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes, DE_bat
         df_correction=False,
         n_cores=n_cores,
         gpu_batch_size=DE_batch_size,
-        icc_gpu=icc_gpu
+        icc_gpu=icc_gpu,
+        counts_layer=counts_layer
     )
     
     # Count number of DE genes meeting criteria
@@ -700,11 +710,11 @@ def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes, DE_bat
         return 0
     # Calculate DE score
     return np.sum(np.minimum(-np.log10(de_genes['p.value.adj']), 20))
-def dge_2samples(adata, features=None, ident_1=None, ident_2=None, groupby='leiden', fc_thr=1.0, min_pct=0.0, max_pval=1.0, min_count=30, icc='i', df_correction=False, n_cores=1, use_gpu=True, gpu_batch_size=2048, icc_gpu=True):
+def dge_2samples(adata, features=None, ident_1=None, ident_2=None, groupby='leiden', fc_thr=1.0, min_pct=0.0, max_pval=1.0, min_count=30, icc='i', df_correction=False, n_cores=1, use_gpu=True, gpu_batch_size=2048, icc_gpu=True, counts_layer=DEFAULT_COUNTS_LAYER):
     """
     Analyze differential gene expression between 2 identities using weighted t-test and chi-squared test.
     Args:
-        adata: AnnData object containing the scRNA-seq data with counts in .X or .raw.X.
+        adata: AnnData object containing the scRNA-seq data with counts in a layer, .raw.X, or .X.
         features: List of genes to analyze. If None, all genes are analyzed.
         ident_1: First identity/group for comparison.
         ident_2: Second identity/group for comparison.
@@ -719,6 +729,7 @@ def dge_2samples(adata, features=None, ident_1=None, ident_2=None, groupby='leid
         use_gpu: Use GPU acceleration for chi-squared test (default: True if CUDA available).
         gpu_batch_size: Number of genes to process per GPU batch (default: 2048).
         icc_gpu: Use GPU for ICC weight computation (default: True). Set to False to force CPU.
+        counts_layer: Layer containing raw counts. If absent, falls back to .raw and then .X.
     Returns:
         pd.DataFrame with columns: log2FC, p.value, p.value.adj, Chi2.p.value, pct.1, pct.2.
     """
@@ -726,7 +737,8 @@ def dge_2samples(adata, features=None, ident_1=None, ident_2=None, groupby='leid
     iwt = iter_wght_ttest(
         adata, features, ident_1, ident_2, groupby, fc_thr, min_pct, 
         max_pval, min_count, icc, df_correction, n_cores,
-        use_gpu=use_gpu, gpu_batch_size=gpu_batch_size, icc_gpu=icc_gpu
+        use_gpu=use_gpu, gpu_batch_size=gpu_batch_size, icc_gpu=icc_gpu,
+        counts_layer=counts_layer
     )
     
     # Use GPU-accelerated chi2 test if available and requested
@@ -734,14 +746,15 @@ def dge_2samples(adata, features=None, ident_1=None, ident_2=None, groupby='leid
         chi2 = chi2_test_gpu(
             adata, list(iwt.index), ident_1, ident_2, groupby, 
             fc_thr=1.0, min_pct=0.0, max_pval=max_pval, 
-            min_count=0, batch_size=gpu_batch_size, device=None
+            min_count=0, batch_size=gpu_batch_size, device=None,
+            counts_layer=counts_layer
         )
     else:
         # Fall back to CPU version
         chi2 = chi2_test(
             adata, list(iwt.index), ident_1, ident_2, groupby, 
             fc_thr=1.0, min_pct=0.0, max_pval=max_pval, 
-            min_count=0, n_cores=n_cores
+            min_count=0, n_cores=n_cores, counts_layer=counts_layer
         )
     
     # Merge results
@@ -804,7 +817,7 @@ def _chi2_contingency_gpu(observed: torch.Tensor) -> torch.Tensor:
     return p_values
 
 
-def chi2_test_gpu(adata, features=None, ident_1=None, ident_2=None, groupby='leiden', fc_thr=1.0, min_pct=0.0, max_pval=1.0, min_count=30, batch_size=1000, device=None):
+def chi2_test_gpu(adata, features=None, ident_1=None, ident_2=None, groupby='leiden', fc_thr=1.0, min_pct=0.0, max_pval=1.0, min_count=30, batch_size=1000, device=None, counts_layer=DEFAULT_COUNTS_LAYER):
     """
     GPU-accelerated chi-squared test for differential gene expression.
     Uses PyTorch for vectorized operations on GPU.
@@ -820,6 +833,7 @@ def chi2_test_gpu(adata, features=None, ident_1=None, ident_2=None, groupby='lei
         min_count: Minimum aggregate count in at least one group.
         batch_size: Number of genes to process per GPU batch (default: 1000).
         device: PyTorch device to use (e.g., 'cuda:0'). If None, uses default _DEVICE.
+        counts_layer: Layer containing raw counts. If absent, falls back to .raw and then .X.
     Returns:
         pd.DataFrame with columns: log2FC, p.value.
     """
@@ -835,13 +849,8 @@ def chi2_test_gpu(adata, features=None, ident_1=None, ident_2=None, groupby='lei
     else:
         gene_list = features
     
-    # Get count matrix (prefer raw if available)
-    if adata.raw is not None:
-        X = adata.raw.X
-        var_names = adata.raw.var_names
-    else:
-        X = adata.X
-        var_names = adata.var_names
+    # Get count matrix
+    X, var_names = _get_count_matrix(adata, counts_layer)
     
     # Subset by identities
     mask_1 = (adata.obs[groupby] == ident_1).values
@@ -966,7 +975,7 @@ def chi2_test_gpu(adata, features=None, ident_1=None, ident_2=None, groupby='lei
     return output
 
 
-def chi2_test(adata, features=None, ident_1=None, ident_2=None, groupby='leiden', fc_thr=1.0, min_pct=0.0, max_pval=1.0, min_count=30, n_cores=1):
+def chi2_test(adata, features=None, ident_1=None, ident_2=None, groupby='leiden', fc_thr=1.0, min_pct=0.0, max_pval=1.0, min_count=30, n_cores=1, counts_layer=DEFAULT_COUNTS_LAYER):
     """
     Perform chi-squared test for differential gene expression.
     Args:
@@ -980,6 +989,7 @@ def chi2_test(adata, features=None, ident_1=None, ident_2=None, groupby='leiden'
         max_pval: Maximum p-value for reporting results.
         min_count: Minimum aggregate count in at least one group.
         n_cores: Number of CPU cores for parallel processing.
+        counts_layer: Layer containing raw counts. If absent, falls back to .raw and then .X.
     Returns:
         pd.DataFrame with columns: log2FC, p.value.
     """
@@ -992,13 +1002,8 @@ def chi2_test(adata, features=None, ident_1=None, ident_2=None, groupby='leiden'
     else:
         gene_list = features
     
-    # Get count matrix (prefer raw if available)
-    if adata.raw is not None:
-        X = adata.raw.X
-        var_names = adata.raw.var_names
-    else:
-        X = adata.X
-        var_names = adata.var_names
+    # Get count matrix
+    X, var_names = _get_count_matrix(adata, counts_layer)
     
     # Subset by identities
     mask_1 = (adata.obs[groupby] == ident_1).values
@@ -1195,7 +1200,7 @@ def _weighted_ttest_gpu(x1_batch, x2_batch, w1_batch, w2_batch):
     return p_values
 
 
-def iter_wght_ttest_gpu(adata, features=None, ident_1=None, ident_2=None, groupby='leiden', fc_thr=1.0, min_pct=0.0, max_pval=1.0, min_count=30, icc='i', df_correction=False, batch_size=500, device=None, n_cores=1, icc_gpu=True):
+def iter_wght_ttest_gpu(adata, features=None, ident_1=None, ident_2=None, groupby='leiden', fc_thr=1.0, min_pct=0.0, max_pval=1.0, min_count=30, icc='i', df_correction=False, batch_size=500, device=None, n_cores=1, icc_gpu=True, counts_layer=DEFAULT_COUNTS_LAYER):
     """
     GPU-accelerated weighted t-test with iterative weight calculation.
     Uses PyTorch for vectorized operations. ICC weights computed based on icc_gpu setting,
@@ -1216,6 +1221,7 @@ def iter_wght_ttest_gpu(adata, features=None, ident_1=None, ident_2=None, groupb
         device: Device to use. If None, uses CUDA if available.
         n_cores: Number of CPU cores for parallel ICC weight computation (default: 1).
         icc_gpu: Use GPU for ICC weight computation (default: True). Set to False to force CPU.
+        counts_layer: Layer containing raw counts. If absent, falls back to .raw and then .X.
     Returns:
         pd.DataFrame with columns: log2FC, p.value, p.value.adj, pct.1, pct.2.
     """
@@ -1232,12 +1238,7 @@ def iter_wght_ttest_gpu(adata, features=None, ident_1=None, ident_2=None, groupb
         gene_list = features
     
     # Get count matrix
-    if adata.raw is not None:
-        X = adata.raw.X
-        var_names = adata.raw.var_names
-    else:
-        X = adata.X
-        var_names = adata.var_names
+    X, var_names = _get_count_matrix(adata, counts_layer)
     
     # Subset by identities
     mask_1 = (adata.obs[groupby] == ident_1).values
@@ -1399,7 +1400,7 @@ def iter_wght_ttest_gpu(adata, features=None, ident_1=None, ident_2=None, groupb
     return output
 
 
-def iter_wght_ttest(adata, features=None, ident_1=None, ident_2=None, groupby='leiden', fc_thr=1.0, min_pct=0.0, max_pval=1.0, min_count=30, icc='i', df_correction=False, n_cores=1, use_gpu=True, gpu_batch_size=500, icc_gpu=True):
+def iter_wght_ttest(adata, features=None, ident_1=None, ident_2=None, groupby='leiden', fc_thr=1.0, min_pct=0.0, max_pval=1.0, min_count=30, icc='i', df_correction=False, n_cores=1, use_gpu=True, gpu_batch_size=500, icc_gpu=True, counts_layer=DEFAULT_COUNTS_LAYER):
     """
     Perform weighted t-test with iterative weight calculation.
     Args:
@@ -1418,6 +1419,7 @@ def iter_wght_ttest(adata, features=None, ident_1=None, ident_2=None, groupby='l
         use_gpu: Use GPU acceleration if available (default: True).
         gpu_batch_size: Number of genes to process per GPU batch (default: 500).
         icc_gpu: Use GPU for ICC weight computation (default: True). Set to False to force CPU.
+        counts_layer: Layer containing raw counts. If absent, falls back to .raw and then .X.
     Returns:
         pd.DataFrame with columns: log2FC, p.value, p.value.adj, pct.1, pct.2.
     """
@@ -1425,7 +1427,8 @@ def iter_wght_ttest(adata, features=None, ident_1=None, ident_2=None, groupby='l
     if use_gpu and _GPU_AVAILABLE:
         return iter_wght_ttest_gpu(
             adata, features, ident_1, ident_2, groupby, fc_thr, min_pct,
-            max_pval, min_count, icc, df_correction, gpu_batch_size, device=None, n_cores=n_cores, icc_gpu=icc_gpu
+            max_pval, min_count, icc, df_correction, gpu_batch_size, device=None, n_cores=n_cores, icc_gpu=icc_gpu,
+            counts_layer=counts_layer
         )
     
     # Fall back to CPU version
@@ -1439,12 +1442,7 @@ def iter_wght_ttest(adata, features=None, ident_1=None, ident_2=None, groupby='l
         gene_list = features
     
     # Get count matrix
-    if adata.raw is not None:
-        X = adata.raw.X
-        var_names = adata.raw.var_names
-    else:
-        X = adata.X
-        var_names = adata.var_names
+    X, var_names = _get_count_matrix(adata, counts_layer)
     
     # Subset by identities
     mask_1 = (adata.obs[groupby] == ident_1).values
