@@ -266,10 +266,26 @@ def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_lo
     
     # Final validation: ensure all clusters have DE_score > min_score with their closest cluster
     print('Performing final validation of cluster separation...')
+    final_validation_state = {
+        'pairs': {},
+        'cluster_versions': {},
+    }
     final_validation_changes = True
     while final_validation_changes:
         final_validation_changes = False
         current_clusters = adata.obs['leiden'].cat.categories.copy()
+        current_cluster_keys = {str(cluster) for cluster in current_clusters}
+        cluster_versions = final_validation_state['cluster_versions']
+        for cluster_key in current_cluster_keys:
+            cluster_versions.setdefault(cluster_key, 0)
+        for cluster_key in list(cluster_versions):
+            if cluster_key not in current_cluster_keys:
+                del cluster_versions[cluster_key]
+        final_validation_state['pairs'] = {
+            pair_key: pair_state
+            for pair_key, pair_state in final_validation_state['pairs'].items()
+            if set(pair_key).issubset(current_cluster_keys)
+        }
         
         if len(current_clusters) < 2:
             break
@@ -312,15 +328,42 @@ def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_lo
             if nearest_cluster_size == 0:
                 continue
             
+            cluster_key = str(cluster)
+            nearest_cluster_key = str(nearest_cluster)
+            pair_key = tuple(sorted([cluster_key, nearest_cluster_key]))
+            current_pair_versions = {
+                cluster_key: cluster_versions.get(cluster_key, 0),
+                nearest_cluster_key: cluster_versions.get(nearest_cluster_key, 0),
+            }
+            pair_state = final_validation_state['pairs'].get(pair_key)
+            if (
+                pair_state is not None
+                and pair_state.get('compared', False)
+                and pair_state.get('cluster_versions') == current_pair_versions
+            ):
+                continue
+            
             # Calculate DE score between cluster and its nearest neighbor
             de_score = DE_Score(adata, cluster, nearest_cluster, min_pct, min_log2_fc, min_de_genes, DE_batch_size=DE_batch_size, n_cores=n_cores, icc_gpu=icc_gpu, min_pval=min_pval, pct_diff=pct_diff, counts_layer=counts_layer)
             
             if de_score < min_score:
                 print(f"Final validation: merging cluster {cluster} ({cluster_size} cells) with nearest cluster {nearest_cluster} ({nearest_cluster_size} cells) - DE score: {de_score:.2f}")
                 adata.obs.loc[adata.obs['leiden'] == cluster, 'leiden'] = nearest_cluster
+                cluster_versions[nearest_cluster_key] = cluster_versions.get(nearest_cluster_key, 0) + 1
+                cluster_versions.pop(cluster_key, None)
+                final_validation_state['pairs'] = {
+                    cached_pair_key: cached_pair_state
+                    for cached_pair_key, cached_pair_state in final_validation_state['pairs'].items()
+                    if cluster_key not in cached_pair_key and nearest_cluster_key not in cached_pair_key
+                }
                 final_validation_changes = True
                 # Start over after a merge
                 break
+            else:
+                final_validation_state['pairs'][pair_key] = {
+                    'compared': True,
+                    'cluster_versions': current_pair_versions.copy(),
+                }
         
         if final_validation_changes:
             adata.obs['leiden'] = adata.obs['leiden'].cat.remove_unused_categories()
