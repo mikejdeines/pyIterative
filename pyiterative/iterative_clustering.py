@@ -1039,16 +1039,15 @@ def chi2_test_gpu(adata, features=None, ident_1=None, ident_2=None, groupby='lei
         
         # Extract batch data
         if sp.issparse(Ci_1_csc):
-            # Get columns for this batch
-            h1_batch = np.column_stack([Ci_1_csc[:, idx].toarray().flatten() for idx in batch_indices])
-            h2_batch = np.column_stack([Ci_2_csc[:, idx].toarray().flatten() for idx in batch_indices])
+            h1_batch_sparse = Ci_1_csc[:, batch_indices]
+            h2_batch_sparse = Ci_2_csc[:, batch_indices]
+            nonzero_1 = _sparse_csc_nonzero_counts(h1_batch_sparse)
+            nonzero_2 = _sparse_csc_nonzero_counts(h2_batch_sparse)
         else:
             h1_batch = Ci_1_csc[:, batch_indices]
             h2_batch = Ci_2_csc[:, batch_indices]
-        
-        # Compute nonzero counts
-        nonzero_1 = np.count_nonzero(h1_batch, axis=0)
-        nonzero_2 = np.count_nonzero(h2_batch, axis=0)
+            nonzero_1 = np.count_nonzero(h1_batch, axis=0)
+            nonzero_2 = np.count_nonzero(h2_batch, axis=0)
         
         pct_1 = nonzero_1 / Nc_1
         pct_2 = nonzero_2 / Nc_2
@@ -1184,10 +1183,8 @@ def chi2_test(adata, features=None, ident_1=None, ident_2=None, groupby='leiden'
         
         # Get gene expression for min_pct calculation
         if is_sparse:
-            h_1 = Ci_1[:, idx].toarray().flatten()
-            h_2 = Ci_2[:, idx].toarray().flatten()
-            nonzero_1 = np.count_nonzero(h_1)
-            nonzero_2 = np.count_nonzero(h_2)
+            nonzero_1 = _sparse_column_nonzero_count(Ci_1, idx)
+            nonzero_2 = _sparse_column_nonzero_count(Ci_2, idx)
         else:
             nonzero_1 = np.count_nonzero(Ci_1[:, idx])
             nonzero_2 = np.count_nonzero(Ci_2[:, idx])
@@ -1235,21 +1232,232 @@ def chi2_test(adata, features=None, ident_1=None, ident_2=None, groupby='leiden'
     return output
 
 
+def _sparse_column_view(matrix_csc, idx):
+    """Return nonzero row indices and values for one CSC column."""
+    start = matrix_csc.indptr[idx]
+    end = matrix_csc.indptr[idx + 1]
+    rows = matrix_csc.indices[start:end]
+    values = matrix_csc.data[start:end]
+    if values.size and np.any(values == 0):
+        keep = values != 0
+        rows = rows[keep]
+        values = values[keep]
+    return rows, values
+
+
+def _sparse_column_nonzero_count(matrix_csc, idx):
+    start = matrix_csc.indptr[idx]
+    end = matrix_csc.indptr[idx + 1]
+    values = matrix_csc.data[start:end]
+    if values.size and np.any(values == 0):
+        return int(np.count_nonzero(values))
+    return int(end - start)
+
+
+def _sparse_csc_nonzero_counts(matrix_csc):
+    counts = np.diff(matrix_csc.indptr).astype(np.int64, copy=False)
+    if matrix_csc.data.size and np.any(matrix_csc.data == 0):
+        counts = np.array([
+            np.count_nonzero(matrix_csc.data[matrix_csc.indptr[i]:matrix_csc.indptr[i + 1]])
+            for i in range(matrix_csc.shape[1])
+        ], dtype=np.int64)
+    return counts
+
+
+def _sparse_column_sum(matrix_csc, idx):
+    start = matrix_csc.indptr[idx]
+    end = matrix_csc.indptr[idx + 1]
+    return matrix_csc.data[start:end].sum()
+
+
+def _sparse_weighted_moments(matrix_csc, idx, n, weights):
+    """Weighted mean and variance for x=h/n stored as one sparse count column."""
+    weights = np.asarray(weights, dtype=np.float64)
+    weight_sum = weights.sum()
+    if weight_sum <= 0:
+        raise ValueError("Weights must sum to a positive value")
+    weights = weights / weight_sum
+    total_w2 = np.square(weights).sum()
+    var_denom = 1 - total_w2
+
+    rows, values = _sparse_column_view(matrix_csc, idx)
+    if rows.size:
+        n_rows = n[rows]
+        valid = n_rows > 0
+        rows = rows[valid]
+        values = values[valid]
+        n_rows = n_rows[valid]
+        x = values / n_rows
+        w = weights[rows]
+        w2 = np.square(w)
+        mean = np.sum(x * w)
+        sparse_x_w2 = np.sum(x * w2)
+        sparse_x2_w2 = np.sum(np.square(x) * w2)
+    else:
+        mean = 0.0
+        sparse_x_w2 = 0.0
+        sparse_x2_w2 = 0.0
+
+    if var_denom <= 0:
+        variance = 0.0
+    else:
+        var_num = sparse_x2_w2 - 2 * mean * sparse_x_w2 + mean**2 * total_w2
+        variance = max(var_num / var_denom, 0.0)
+    n_eff = 1 / total_w2 if total_w2 > 0 else len(weights)
+    return mean, variance, n_eff
+
+
+def weighted_ttest_sparse_columns(Ci_1, Ci_2, idx, Ni_1, Ni_2, wi_1, wi_2, df_correction=False):
+    """Compute weighted t-test from sparse count columns without materializing dense expression."""
+    m1, vm1, n_eff_1 = _sparse_weighted_moments(Ci_1, idx, Ni_1, wi_1)
+    m2, vm2, n_eff_2 = _sparse_weighted_moments(Ci_2, idx, Ni_2, wi_2)
+    s12 = np.sqrt(vm1 + vm2)
+    if s12 == 0:
+        return m1, m2, 1.0
+
+    t = (m1 - m2) / s12
+    if df_correction:
+        df_1 = max(n_eff_1 - 1, 1)
+        df_2 = max(n_eff_2 - 1, 1)
+    else:
+        df_1 = max(Ci_1.shape[0] - 1, 1)
+        df_2 = max(Ci_2.shape[0] - 1, 1)
+    denom = vm1**2 / df_1 + vm2**2 / df_2
+    df = s12**4 / denom if denom > 0 else 1
+    p_value = 2 * stats.t.sf(np.abs(t), df=df)
+    return m1, m2, p_value
+
+
+def icc_an_sparse(matrix_csc, idx, n):
+    """ANOVA ICC from one sparse count column without densifying the column."""
+    n = np.asarray(n, dtype=np.float64)
+    N = n.sum()
+    k = len(n)
+    if N <= 0 or k < 2:
+        return 0.0
+
+    rows, values = _sparse_column_view(matrix_csc, idx)
+    valid = n[rows] > 0 if rows.size else np.array([], dtype=bool)
+    rows = rows[valid]
+    values = values[valid]
+    n0 = (1 / (k - 1)) * (N - (np.square(n).sum() / N))
+    h_sum = values.sum()
+    h2_n_sum = np.sum(np.square(values) / n[rows]) if rows.size else 0.0
+    MSw = (1 / (N - k)) * (h_sum - h2_n_sum) if N != k else 0.0
+    MSb = (1 / (k - 1)) * (h2_n_sum - (h_sum**2 / N))
+    denom = MSb + (n0 - 1) * MSw
+    icc = 0.0 if denom == 0 else (MSb - MSw) / denom
+    return np.clip(icc, 0.0, 1.0)
+
+
+def icc_iter_sparse(matrix_csc, idx, n):
+    """Iterative ICC from one sparse count column without densifying the column."""
+    n = np.asarray(n, dtype=np.float64)
+    sum_n = n.sum()
+    if sum_n <= 0:
+        return 0.0
+
+    rows, values = _sparse_column_view(matrix_csc, idx)
+    if rows.size:
+        valid = n[rows] > 0
+        rows = rows[valid]
+        values = values[valid]
+
+    sum_h = values.sum()
+    sum_n_h = np.sum(n[rows] * values) if rows.size else 0.0
+    sum_h2 = np.sum(np.square(values)) if rows.size else 0.0
+    sum_n_sq = np.square(n).sum()
+    x0 = sum_h / sum_n
+    w0_sq_sum = sum_n_sq / sum_n**2
+    var_denom = 1 - w0_sq_sum
+    if var_denom <= 0:
+        return 0.0
+
+    VarT0 = x0 * (1 - x0) / sum_n
+    VarE0 = (sum_h2 / sum_n**2 - 2 * x0 * sum_n_h / sum_n**2 + x0**2 * w0_sq_sum) / var_denom
+    if VarE0 <= VarT0:
+        return 0.0
+
+    def f(icc):
+        wprop = np.divide(
+            n,
+            1 + icc * (n - 1),
+            out=np.zeros_like(n, dtype=np.float64),
+            where=n > 0
+        )
+        sum_wprop = wprop.sum()
+        if sum_wprop <= 0:
+            return 0.0
+        weights = wprop / sum_wprop
+        total_w2 = np.square(weights).sum()
+        if rows.size:
+            x = values / n[rows]
+            w = weights[rows]
+            w2 = np.square(w)
+            x1 = np.sum(x * w)
+            sparse_x_w2 = np.sum(x * w2)
+            sparse_x2_w2 = np.sum(np.square(x) * w2)
+        else:
+            x1 = 0.0
+            sparse_x_w2 = 0.0
+            sparse_x2_w2 = 0.0
+        denom = 1 - total_w2
+        if denom <= 0:
+            return 0.0
+        VarT = x1 * (1 - x1) / sum_wprop
+        VarE = (sparse_x2_w2 - 2 * x1 * sparse_x_w2 + x1**2 * total_w2) / denom
+        return VarE - VarT
+
+    try:
+        icc_val = brenth(f, 0, 1, xtol=1e-4 / max(n.max(), 1))
+        return min(icc_val, 1.0)
+    except ValueError:
+        return 0.0
+
+
+def icc_weight_sparse(matrix_csc, idx, n, icc='i'):
+    """Calculate ICC weights from one sparse count column without densifying counts."""
+    Nc = len(n)
+    if matrix_csc.shape[0] != Nc:
+        raise ValueError("Sparse matrix row count must match n length")
+    if Nc < 3:
+        raise ValueError("At least 3 observations are required")
+
+    if _sparse_column_nonzero_count(matrix_csc, idx) < 3:
+        return np.ones(Nc) / Nc
+
+    if icc == 'i':
+        icc_val = icc_iter_sparse(matrix_csc, idx, n)
+    elif icc == 'A':
+        icc_val = icc_an_sparse(matrix_csc, idx, n)
+    elif icc in [0, 1]:
+        icc_val = float(icc)
+    else:
+        raise ValueError("Invalid icc, must be 'i', 'A', 0, or 1")
+
+    n = np.asarray(n, dtype=np.float64)
+    wprop = np.divide(
+        n,
+        1 + icc_val * (n - 1),
+        out=np.zeros_like(n, dtype=np.float64),
+        where=n > 0
+    )
+    wprop_sum = wprop.sum()
+    if wprop_sum <= 0:
+        return np.ones(Nc) / Nc
+    return wprop / wprop_sum
+
+
 def _process_gene_weighted_ttest(args):
     """Helper function for parallel processing in iter_wght_ttest."""
     gene_name, idx, Ci_1, Ci_2, Xi_1, Xi_2, Ni_1, Ni_2, Nc_1, Nc_2, min_count, min_pct, fc_thr, max_pval, icc, df_correction, is_sparse = args
     
     # Get counts for this gene
     if is_sparse:
-        # CSC format allows efficient column slicing
-        h_1 = Ci_1[:, idx].toarray().flatten()
-        h_2 = Ci_2[:, idx].toarray().flatten()
-        xi_1 = Xi_1[:, idx].toarray().flatten()
-        xi_2 = Xi_2[:, idx].toarray().flatten()
-        
-        # Count nonzeros efficiently
-        nonzero_1 = np.count_nonzero(h_1)
-        nonzero_2 = np.count_nonzero(h_2)
+        AC_1 = _sparse_column_sum(Ci_1, idx)
+        AC_2 = _sparse_column_sum(Ci_2, idx)
+        nonzero_1 = _sparse_column_nonzero_count(Ci_1, idx)
+        nonzero_2 = _sparse_column_nonzero_count(Ci_2, idx)
     else:
         h_1 = Ci_1[:, idx]
         h_2 = Ci_2[:, idx]
@@ -1257,28 +1465,34 @@ def _process_gene_weighted_ttest(args):
         xi_2 = Xi_2[:, idx]
         nonzero_1 = np.count_nonzero(xi_1)
         nonzero_2 = np.count_nonzero(xi_2)
-    
-    AC_1 = h_1.sum()
-    AC_2 = h_2.sum()
+        AC_1 = h_1.sum()
+        AC_2 = h_2.sum()
     
     pct_1 = nonzero_1 / Nc_1
     pct_2 = nonzero_2 / Nc_2
     
     if (AC_1 >= min_count or AC_2 >= min_count) and \
        (pct_1 > min_pct or pct_2 > min_pct):
-        
-        wi_1 = icc_weight(h_1, Ni_1, icc)
-        wi_2 = icc_weight(h_2, Ni_2, icc)
-        
-        fc = (xi_1 * wi_1).sum() / (xi_2 * wi_2).sum() if (xi_2 * wi_2).sum() > 0 else np.nan
+        if is_sparse:
+            wi_1 = icc_weight_sparse(Ci_1, idx, Ni_1, icc)
+            wi_2 = icc_weight_sparse(Ci_2, idx, Ni_2, icc)
+            mean_1, mean_2, p_value = weighted_ttest_sparse_columns(
+                Ci_1, Ci_2, idx, Ni_1, Ni_2, wi_1, wi_2, df_correction
+            )
+            fc = mean_1 / mean_2 if mean_2 > 0 else np.nan
+        else:
+            wi_1 = icc_weight(h_1, Ni_1, icc)
+            wi_2 = icc_weight(h_2, Ni_2, icc)
+            fc = (xi_1 * wi_1).sum() / (xi_2 * wi_2).sum() if (xi_2 * wi_2).sum() > 0 else np.nan
         
         if not np.isnan(fc) and (fc >= fc_thr or fc <= 1/fc_thr) and \
            (nonzero_1 >= 3 or nonzero_2 >= 3):
             
-            if df_correction:
-                p_value = alt_wttest2(xi_1, xi_2, wi_1, wi_2)
-            else:
-                p_value = alt_wttest(xi_1, xi_2, wi_1, wi_2)
+            if not is_sparse:
+                if df_correction:
+                    p_value = alt_wttest2(xi_1, xi_2, wi_1, wi_2)
+                else:
+                    p_value = alt_wttest(xi_1, xi_2, wi_1, wi_2)
             
             if p_value <= max_pval:
                 return {
@@ -1431,27 +1645,29 @@ def iter_wght_ttest_gpu(adata, features=None, ident_1=None, ident_2=None, groupb
         
         # Extract batch data
         if is_sparse:
-            h1_list = [Ci_1[:, idx].toarray().flatten() for idx in batch_indices]
-            h2_list = [Ci_2[:, idx].toarray().flatten() for idx in batch_indices]
-            xi1_list = [Xi_1[:, idx].toarray().flatten() for idx in batch_indices]
-            xi2_list = [Xi_2[:, idx].toarray().flatten() for idx in batch_indices]
+            h1_batch_sparse = Ci_1[:, batch_indices]
+            h2_batch_sparse = Ci_2[:, batch_indices]
+            nonzero_1 = np.diff(h1_batch_sparse.indptr)
+            nonzero_2 = np.diff(h2_batch_sparse.indptr)
+            AC_1_batch = np.asarray(h1_batch_sparse.sum(axis=0)).ravel()
+            AC_2_batch = np.asarray(h2_batch_sparse.sum(axis=0)).ravel()
         else:
             h1_list = [Ci_1[:, idx] for idx in batch_indices]
             h2_list = [Ci_2[:, idx] for idx in batch_indices]
             xi1_list = [Xi_1[:, idx] for idx in batch_indices]
             xi2_list = [Xi_2[:, idx] for idx in batch_indices]
-        
-        # Stack into arrays
-        h1_batch = np.stack(h1_list, axis=0)
-        h2_batch = np.stack(h2_list, axis=0)
-        xi1_batch = np.stack(xi1_list, axis=0)
-        xi2_batch = np.stack(xi2_list, axis=0)
-        
-        # Compute statistics per gene
-        nonzero_1 = np.count_nonzero(h1_batch, axis=1)
-        nonzero_2 = np.count_nonzero(h2_batch, axis=1)
-        AC_1_batch = h1_batch.sum(axis=1)
-        AC_2_batch = h2_batch.sum(axis=1)
+
+            # Stack into arrays
+            h1_batch = np.stack(h1_list, axis=0)
+            h2_batch = np.stack(h2_list, axis=0)
+            xi1_batch = np.stack(xi1_list, axis=0)
+            xi2_batch = np.stack(xi2_list, axis=0)
+
+            # Compute statistics per gene
+            nonzero_1 = np.count_nonzero(h1_batch, axis=1)
+            nonzero_2 = np.count_nonzero(h2_batch, axis=1)
+            AC_1_batch = h1_batch.sum(axis=1)
+            AC_2_batch = h2_batch.sum(axis=1)
         pct_1 = nonzero_1 / Nc_1
         pct_2 = nonzero_2 / Nc_2
         
@@ -1462,18 +1678,51 @@ def iter_wght_ttest_gpu(adata, features=None, ident_1=None, ident_2=None, groupb
         if not valid_mask.any():
             continue
         
-        # Compute ICC weights on CPU with parallelization
-        valid_h1 = [h1_batch[i] for i in range(len(batch_genes)) if valid_mask[i]]
-        valid_h2 = [h2_batch[i] for i in range(len(batch_genes)) if valid_mask[i]]
+        valid_idx = np.where(valid_mask)[0]
+        if is_sparse:
+            valid_abs_indices = [batch_indices[i] for i in valid_idx]
+            w1_list = None
+            w2_list = None
+            if icc_gpu and _CUPY_AVAILABLE and (icc == 'i' or icc in [0, 1]):
+                try:
+                    w1_list = compute_icc_weights_sparse_gpu(Ci_1, Ni_1, valid_abs_indices, icc, icc_gpu=icc_gpu)
+                    w2_list = compute_icc_weights_sparse_gpu(Ci_2, Ni_2, valid_abs_indices, icc, icc_gpu=icc_gpu)
+                except Exception:
+                    w1_list = None
+                    w2_list = None
+            if w1_list is None or w2_list is None:
+                w1_list = [icc_weight_sparse(Ci_1, idx, Ni_1, icc) for idx in valid_abs_indices]
+                w2_list = [icc_weight_sparse(Ci_2, idx, Ni_2, icc) for idx in valid_abs_indices]
+        else:
+            # Compute ICC weights on CPU with parallelization
+            valid_h1 = [h1_batch[i] for i in range(len(batch_genes)) if valid_mask[i]]
+            valid_h2 = [h2_batch[i] for i in range(len(batch_genes)) if valid_mask[i]]
         
-        w1_list = compute_icc_weights_parallel(valid_h1, Ni_1, icc, n_cores, icc_gpu=icc_gpu)
-        w2_list = compute_icc_weights_parallel(valid_h2, Ni_2, icc, n_cores, icc_gpu=icc_gpu)
+            w1_list = compute_icc_weights_parallel(valid_h1, Ni_1, icc, n_cores, icc_gpu=icc_gpu)
+            w2_list = compute_icc_weights_parallel(valid_h2, Ni_2, icc, n_cores, icc_gpu=icc_gpu)
         
         if len(w1_list) == 0:
             continue
+        if is_sparse:
+            for i, abs_idx in enumerate(valid_abs_indices):
+                mean_1, mean_2, p_val = weighted_ttest_sparse_columns(
+                    Ci_1, Ci_2, abs_idx, Ni_1, Ni_2, w1_list[i], w2_list[i], df_correction
+                )
+                fc = mean_1 / mean_2 if mean_2 > 0 else np.nan
+                orig_idx = valid_idx[i]
+                if not np.isnan(fc) and (fc >= fc_thr or fc <= 1/fc_thr) and \
+                   ((nonzero_1[orig_idx] >= 3) or (nonzero_2[orig_idx] >= 3)) and \
+                   p_val <= max_pval:
+                    results.append({
+                        'gene': batch_names[orig_idx],
+                        'log2FC': np.log2(fc + np.finfo(np.float32).tiny),
+                        'p.value': float(p_val),
+                        'pct.1': pct_1[orig_idx],
+                        'pct.2': pct_2[orig_idx]
+                    })
+            continue
         
         # Get valid data
-        valid_idx = np.where(valid_mask)[0]
         xi1_valid = xi1_batch[valid_idx]
         xi2_valid = xi2_batch[valid_idx]
         w1_valid = np.stack(w1_list, axis=0)
@@ -1834,7 +2083,7 @@ def compute_icc_weights_parallel(h_list, n, icc, n_cores=1, icc_gpu=True):
         try:
             if icc in [0, 1] and len(h_list) >= 10:
                 return _compute_icc_weights_gpu_batch(h_list, n, icc)
-            elif icc in ['i', 'A'] and len(h_list) >= 50:
+            elif icc == 'i' and len(h_list) >= 50:
                 return _compute_icc_weights_gpu_rootfinding(h_list, n, icc)
         except Exception:
             # Fallback to CPU if GPU processing fails
@@ -1842,6 +2091,29 @@ def compute_icc_weights_parallel(h_list, n, icc, n_cores=1, icc_gpu=True):
     
     # Sequential CPU processing
     return [icc_weight(h, n, icc) for h in h_list]
+
+
+def compute_icc_weights_sparse_gpu(Ci_csc, n, gene_indices, icc, icc_gpu=True):
+    """
+    Compute ICC weights for sparse CSC count columns without densifying counts.
+    Currently accelerates fixed ICC values and iterative ICC ('i') with CuPy.
+    Falls back to the caller for unsupported modes.
+    """
+    if not gene_indices:
+        return []
+    if not sp.issparse(Ci_csc):
+        raise ValueError("compute_icc_weights_sparse_gpu requires a sparse matrix")
+    if not icc_gpu or not _CUPY_AVAILABLE:
+        raise RuntimeError("CuPy GPU ICC is not available")
+
+    n = np.asarray(n, dtype=np.float32)
+    if icc in [0, 1]:
+        return _compute_fixed_icc_weights_gpu(len(gene_indices), n, float(icc))
+    if icc != 'i':
+        raise ValueError("Sparse GPU ICC currently supports only icc='i', 0, or 1")
+
+    batch_csc = Ci_csc[:, gene_indices].tocsc()
+    return _compute_icc_weights_sparse_gpu_iterative(batch_csc, n)
 
 
 def _compute_icc_weights_gpu_batch(h_list, n, icc_val):
@@ -1855,27 +2127,18 @@ def _compute_icc_weights_gpu_batch(h_list, n, icc_val):
     Returns:
         List of weight arrays, one per gene.
     """
-    # Use cached n array on GPU if available (eliminates repeated transfers)
-    n_hash = hash(n.tobytes())
-    if _GPU_CACHE.get('n_hash') == n_hash:
-        n_gpu = _GPU_CACHE['n_array']
-    else:
-        n_gpu = cp.asarray(n, dtype=cp.float32)
-        _GPU_CACHE['n_array'] = n_gpu
-        _GPU_CACHE['n_hash'] = n_hash
+    return _compute_fixed_icc_weights_gpu(len(h_list), n, float(icc_val))
     
-    # Stack genes using pinned memory for faster transfer
-    h_stacked = np.stack(h_list, axis=0).astype(np.float32)
-    h_matrix = cp.asarray(h_stacked)
     
-    # Vectorized computation across all genes
-    wprop = n_gpu / (1 + float(icc_val) * (n_gpu - 1))
-    wprop_sum = wprop.sum()
-    weights = wprop / wprop_sum
-    
-    # Use pinned memory for faster GPU→CPU transfer
+def _compute_fixed_icc_weights_gpu(n_genes, n, icc_val):
+    """Return repeated fixed-ICC weights computed on GPU."""
+    n_gpu = _get_cached_n_gpu(n)
+    denom = 1 + float(icc_val) * (n_gpu - 1)
+    denom = cp.where(n_gpu > 0, denom, 1.0)
+    wprop = cp.where(n_gpu > 0, n_gpu / denom, 0.0)
+    weights = wprop / wprop.sum()
     weights_cpu = cp.asnumpy(weights)
-    return list(weights_cpu)
+    return [weights_cpu.copy() for _ in range(n_genes)]
 
 
 def _compute_icc_weights_gpu_rootfinding(h_list, n, icc_method):
@@ -1885,7 +2148,7 @@ def _compute_icc_weights_gpu_rootfinding(h_list, n, icc_method):
     Args:
         h_list: List of count arrays, one per gene (genes x samples).
         n: Total counts per observation (same for all genes).
-        icc_method: ICC method: 'i' (iterative) or 'A' (ANOVA).
+        icc_method: ICC method. Only 'i' is routed here; 'A' uses the CPU fallback.
     Returns:
         List of weight arrays, one per gene.
     """
@@ -1938,6 +2201,243 @@ def _compute_icc_weights_gpu_rootfinding(h_list, n, icc_method):
     weights = wprop / wprop_sum
     
     # Transfer back to CPU efficiently and return list of views
+    weights_cpu = cp.asnumpy(weights)
+    return list(weights_cpu)
+
+
+def _get_cached_n_gpu(n):
+    """Cache total-count vectors on GPU across ICC calls."""
+    n = np.asarray(n, dtype=np.float32)
+    n_hash = hash(n.tobytes())
+    if _GPU_CACHE.get('n_hash') == n_hash:
+        return _GPU_CACHE['n_array']
+
+    n_gpu = cp.asarray(n, dtype=cp.float32)
+    _GPU_CACHE['n_array'] = n_gpu
+    _GPU_CACHE['n_hash'] = n_hash
+    return n_gpu
+
+
+_SPARSE_ICC_BISECTION_KERNEL = r'''
+__device__ float sparse_icc_eval_one(
+    const long long start,
+    const long long end,
+    const int* indices,
+    const float* data,
+    const float* n_vals,
+    const int n_cells,
+    const float icc
+) {
+    float wprop_sum = 0.0f;
+    float wprop_sq_sum = 0.0f;
+
+    for (int i = 0; i < n_cells; i++) {
+        const float n = n_vals[i];
+        if (n <= 0.0f) continue;
+        const float denom = 1.0f + icc * (n - 1.0f);
+        if (denom <= 0.0f) continue;
+        const float wprop = n / denom;
+        wprop_sum += wprop;
+        wprop_sq_sum += wprop * wprop;
+    }
+
+    if (wprop_sum <= 0.0f) return 0.0f;
+
+    const float inv_wprop_sum = 1.0f / wprop_sum;
+    const float w_sq_sum = wprop_sq_sum * inv_wprop_sum * inv_wprop_sum;
+    const float var_e_denom = 1.0f - w_sq_sum;
+    if (var_e_denom <= 1e-12f) return 0.0f;
+
+    float x1 = 0.0f;
+    float sparse_x_w2 = 0.0f;
+    float sparse_x2_w2 = 0.0f;
+
+    for (long long p = start; p < end; p++) {
+        const float h = data[p];
+        if (h == 0.0f) continue;
+        const int row = indices[p];
+        const float n = n_vals[row];
+        if (n <= 0.0f) continue;
+        const float denom = 1.0f + icc * (n - 1.0f);
+        if (denom <= 0.0f) continue;
+        const float wprop = n / denom;
+        const float w = wprop * inv_wprop_sum;
+        const float w2 = w * w;
+        const float x = h / n;
+        x1 += x * w;
+        sparse_x_w2 += x * w2;
+        sparse_x2_w2 += x * x * w2;
+    }
+
+    const float var_t = x1 * (1.0f - x1) / wprop_sum;
+    const float var_e_num = sparse_x2_w2 - 2.0f * x1 * sparse_x_w2 + x1 * x1 * w_sq_sum;
+    const float var_e = var_e_num / var_e_denom;
+    return var_e - var_t;
+}
+
+extern "C" __global__
+void sparse_icc_bisection_kernel(
+    const long long* indptr,
+    const int* indices,
+    const float* data,
+    const float* n_vals,
+    float* icc_out,
+    const int n_genes,
+    const int n_cells,
+    const float sum_n,
+    const float sum_n_sq,
+    const float xtol,
+    const int max_iter
+) {
+    const int gene_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gene_idx >= n_genes) return;
+
+    const long long start = indptr[gene_idx];
+    const long long end = indptr[gene_idx + 1];
+
+    int nonzero_count = 0;
+    float sum_h = 0.0f;
+    float sum_n_h = 0.0f;
+    float sum_h2 = 0.0f;
+
+    for (long long p = start; p < end; p++) {
+        const float h = data[p];
+        if (h == 0.0f) continue;
+        const int row = indices[p];
+        const float n = n_vals[row];
+        if (n <= 0.0f) continue;
+        nonzero_count += 1;
+        sum_h += h;
+        sum_n_h += n * h;
+        sum_h2 += h * h;
+    }
+
+    if (nonzero_count < 3) {
+        icc_out[gene_idx] = -1.0f;
+        return;
+    }
+
+    const float sum_n2 = sum_n * sum_n;
+    const float x0 = sum_h / sum_n;
+    const float w0_sq_sum = sum_n_sq / sum_n2;
+    const float var_e0_denom = 1.0f - w0_sq_sum;
+    if (var_e0_denom <= 1e-12f) {
+        icc_out[gene_idx] = 0.0f;
+        return;
+    }
+
+    const float sparse_x_w0_sq = sum_n_h / sum_n2;
+    const float sparse_x2_w0_sq = sum_h2 / sum_n2;
+    const float var_t0 = x0 * (1.0f - x0) / sum_n;
+    const float var_e0_num = sparse_x2_w0_sq - 2.0f * x0 * sparse_x_w0_sq + x0 * x0 * w0_sq_sum;
+    const float var_e0 = var_e0_num / var_e0_denom;
+    float fa = var_e0 - var_t0;
+
+    if (fa <= 0.0f || !isfinite(fa)) {
+        icc_out[gene_idx] = 0.0f;
+        return;
+    }
+
+    float fb = sparse_icc_eval_one(start, end, indices, data, n_vals, n_cells, 1.0f);
+    if (!isfinite(fb) || fa * fb > 0.0f) {
+        icc_out[gene_idx] = 0.0f;
+        return;
+    }
+
+    float a = 0.0f;
+    float b = 1.0f;
+
+    for (int iter = 0; iter < max_iter; iter++) {
+        const float c = 0.5f * (a + b);
+        const float fc = sparse_icc_eval_one(start, end, indices, data, n_vals, n_cells, c);
+
+        if (!isfinite(fc)) {
+            break;
+        }
+        if (fa * fc > 0.0f) {
+            a = c;
+            fa = fc;
+        } else {
+            b = c;
+        }
+        if ((b - a) < xtol) {
+            break;
+        }
+    }
+
+    icc_out[gene_idx] = 0.5f * (a + b);
+}
+'''
+
+_compiled_sparse_icc_kernel = None
+
+
+def _get_compiled_sparse_icc_kernel():
+    global _compiled_sparse_icc_kernel
+    if _compiled_sparse_icc_kernel is None:
+        _compiled_sparse_icc_kernel = cp.RawKernel(
+            _SPARSE_ICC_BISECTION_KERNEL,
+            'sparse_icc_bisection_kernel'
+        )
+    return _compiled_sparse_icc_kernel
+
+
+def _compute_icc_weights_sparse_gpu_iterative(Ci_csc, n):
+    """
+    Compute iterative ICC weights from sparse CSC columns using a CuPy RawKernel.
+    The sparse count matrix is never converted to a dense gene-by-cell matrix.
+    """
+    if not sp.isspmatrix_csc(Ci_csc):
+        Ci_csc = Ci_csc.tocsc()
+
+    n = np.asarray(n, dtype=np.float32)
+    n_genes = Ci_csc.shape[1]
+    n_cells = Ci_csc.shape[0]
+    if n_genes == 0:
+        return []
+    if n_cells != n.shape[0]:
+        raise ValueError("Sparse matrix row count must match n length")
+    if n.sum() <= 0:
+        raise ValueError("Total counts must be positive for sparse GPU ICC")
+
+    indptr_gpu = cp.asarray(Ci_csc.indptr.astype(np.int64, copy=False))
+    indices_gpu = cp.asarray(Ci_csc.indices.astype(np.int32, copy=False))
+    data_gpu = cp.asarray(Ci_csc.data.astype(np.float32, copy=False))
+    n_gpu = _get_cached_n_gpu(n)
+    icc_vals = cp.empty(n_genes, dtype=cp.float32)
+
+    block_size = 128
+    grid_size = (n_genes + block_size - 1) // block_size
+    xtol = np.float32(1e-4 / max(float(np.max(n)), 1.0))
+    kernel = _get_compiled_sparse_icc_kernel()
+    kernel(
+        (grid_size,), (block_size,),
+        (
+            indptr_gpu,
+            indices_gpu,
+            data_gpu,
+            n_gpu,
+            icc_vals,
+            np.int32(n_genes),
+            np.int32(n_cells),
+            np.float32(n.sum()),
+            np.float32(np.square(n).sum()),
+            xtol,
+            np.int32(30),
+        )
+    )
+    cp.cuda.Stream.null.synchronize()
+
+    effective_icc = cp.maximum(icc_vals, 0.0)
+    denom = 1 + effective_icc[:, None] * (n_gpu[None, :] - 1)
+    denom = cp.where(n_gpu[None, :] > 0, denom, 1.0)
+    wprop = cp.where(n_gpu[None, :] > 0, n_gpu[None, :] / denom, 0.0)
+    weights = wprop / wprop.sum(axis=1, keepdims=True)
+
+    equal_weight_mask = icc_vals < 0
+    if bool(cp.any(equal_weight_mask)):
+        weights[equal_weight_mask, :] = 1.0 / n_cells
+
     weights_cpu = cp.asnumpy(weights)
     return list(weights_cpu)
 
