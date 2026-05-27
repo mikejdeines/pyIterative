@@ -270,6 +270,23 @@ def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_lo
         'pairs': {},
         'cluster_versions': {},
     }
+    initial_final_clusters = adata.obs['leiden'].cat.categories.copy()
+    adata_hvg = None
+    if len(initial_final_clusters) >= 2:
+        # Fit CONCORD once for final validation. Subsequent merges only change
+        # labels, so centroids can be recomputed on this fixed embedding.
+        _run_hvg(adata, n_top_genes=2000, counts_layer=counts_layer, x_is_log_normalized=False, context='final validation', backed_load_chunk_size=backed_load_chunk_size)
+        hvg_genes = adata.var_names[adata.var['highly_variable']].tolist()
+        adata_hvg = _copy_adata(adata, backed_load_chunk_size=backed_load_chunk_size, var_idx=hvg_genes)
+        _ensure_counts_layer(adata_hvg, counts_layer)
+        _set_x_to_counts(adata_hvg, counts_layer)
+        sc.pp.normalize_total(adata_hvg, target_sum=1e4)
+        sc.pp.log1p(adata_hvg)
+        ccd_model = _make_concord_model(adata_hvg, hvg_genes, batch_key, batch_size, ndims, seed,
+                                        concord_chunked=concord_chunked, concord_chunk_size=concord_chunk_size,
+                                        source_is_backed=source_is_backed)
+        ccd_model.fit_transform(output_key='Concord', save_model=False)
+
     final_validation_changes = True
     while final_validation_changes:
         final_validation_changes = False
@@ -290,19 +307,8 @@ def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_lo
         if len(current_clusters) < 2:
             break
         
-        # Calculate centroids for all final clusters in CONCORD space.
-        # Keep the full adata count matrix untouched; normalize only the HVG subset used by CONCORD.
-        _run_hvg(adata, n_top_genes=2000, counts_layer=counts_layer, x_is_log_normalized=False, context='final validation', backed_load_chunk_size=backed_load_chunk_size)
-        hvg_genes = adata.var_names[adata.var['highly_variable']].tolist()
-        adata_hvg = _copy_adata(adata, backed_load_chunk_size=backed_load_chunk_size, var_idx=hvg_genes)
-        _ensure_counts_layer(adata_hvg, counts_layer)
-        _set_x_to_counts(adata_hvg, counts_layer)
-        sc.pp.normalize_total(adata_hvg, target_sum=1e4)
-        sc.pp.log1p(adata_hvg)
-        ccd_model = _make_concord_model(adata_hvg, hvg_genes, batch_key, batch_size, ndims, seed,
-                                        concord_chunked=concord_chunked, concord_chunk_size=concord_chunk_size,
-                                        source_is_backed=source_is_backed)
-        ccd_model.fit_transform(output_key='Concord', save_model=False)
+        adata_hvg.obs['leiden'] = adata.obs['leiden'].copy()
+        adata_hvg.obs['leiden'] = adata_hvg.obs['leiden'].cat.remove_unused_categories()
         final_centroids = Find_Centroids(adata_hvg, cluster_key='leiden', embedding_key='Concord', ndims=ndims)
         
         if final_centroids.shape[0] < 2:
