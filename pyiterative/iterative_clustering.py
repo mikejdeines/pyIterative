@@ -221,7 +221,7 @@ def _make_concord_model(adata, input_feature, batch_key, batch_size, ndims, seed
     return ccd.Concord(**concord_kwargs)
 
 
-def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=4, min_cluster_size=4, batch_key=None, n_cores=None, DE_batch_size=2048, icc_gpu=False, min_pval=0.05, pct_diff=0.7, seed=42, counts_layer=DEFAULT_COUNTS_LAYER, concord_chunked=None, concord_chunk_size=10000, backed_load_chunk_size=None):
+def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=4, min_cluster_size=4, batch_key=None, n_cores=None, DE_batch_size=2048, icc_gpu=False, max_pval=0.05, pct_diff=0.7, seed=42, counts_layer=DEFAULT_COUNTS_LAYER, concord_chunked=None, concord_chunk_size=10000, backed_load_chunk_size=None):
     """
     Wrapper function to perform iterative clustering using scVI and Leiden algorithm.
     Args:
@@ -238,7 +238,7 @@ def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_lo
         n_cores: Number of CPU cores to use for parallel processing (default: max(1, cpu_count() - 1)).
         DE_batch_size: Batch size for GPU processing in dge_2samples (default: 2048).
         icc_gpu: Use GPU for ICC weight computation in dge_2samples (default: False). Set to False to force CPU.
-        min_pval: Minimum BH-adjusted p-value for a gene to be considered differentially expressed (default: 0.05).
+        max_pval: Maximum BH-adjusted p-value for a gene to be considered differentially expressed (default: 0.05).
         pct_diff: Minimum percentage difference threshold for DE genes. If pct_1 > pct_2: pct_diff = (pct_1-pct_2)/pct_1. If pct_2 > pct_1: pct_diff = (pct_2-pct_1)/pct_2 (default: 0.7).
         seed: Random seed for reproducibility (default: 42).
         counts_layer: Layer containing raw counts for HVG and DE analysis. If absent, falls back to .raw and then .X (default: 'counts').
@@ -259,7 +259,7 @@ def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_lo
     previous_num_clusters = 1
     # Iterative loop
     for i in range(num_iterations):
-        adata = Clustering_Iteration(adata, ndims=ndims, min_pct=min_pct, min_log2_fc=min_log2_fc, batch_size=batch_size, min_score=min_score, min_de_genes=min_de_genes, min_cluster_size=min_cluster_size, batch_key=batch_key, n_cores=n_cores, DE_batch_size=DE_batch_size, icc_gpu=icc_gpu, min_pval=min_pval, pct_diff=pct_diff, seed=seed, counts_layer=counts_layer, concord_chunked=concord_chunked, concord_chunk_size=concord_chunk_size, backed_load_chunk_size=backed_load_chunk_size)
+        adata = Clustering_Iteration(adata, ndims=ndims, min_pct=min_pct, min_log2_fc=min_log2_fc, batch_size=batch_size, min_score=min_score, min_de_genes=min_de_genes, min_cluster_size=min_cluster_size, batch_key=batch_key, n_cores=n_cores, DE_batch_size=DE_batch_size, icc_gpu=icc_gpu, max_pval=max_pval, pct_diff=pct_diff, seed=seed, counts_layer=counts_layer, concord_chunked=concord_chunked, concord_chunk_size=concord_chunk_size, backed_load_chunk_size=backed_load_chunk_size)
         if len(adata.obs['leiden'].cat.categories) == previous_num_clusters:
             break
         previous_num_clusters = len(adata.obs['leiden'].cat.categories)
@@ -350,7 +350,7 @@ def Iterative_Clustering(adata, ndims=64, num_iterations=20, min_pct=0.5, min_lo
                 continue
             
             # Calculate DE score between cluster and its nearest neighbor
-            de_score = DE_Score(adata, cluster, nearest_cluster, min_pct, min_log2_fc, min_de_genes, DE_batch_size=DE_batch_size, n_cores=n_cores, icc_gpu=icc_gpu, min_pval=min_pval, pct_diff=pct_diff, counts_layer=counts_layer)
+            de_score = DE_Score(adata, cluster, nearest_cluster, min_pct, min_log2_fc, min_de_genes, DE_batch_size=DE_batch_size, n_cores=n_cores, icc_gpu=icc_gpu, max_pval=max_pval, pct_diff=pct_diff, counts_layer=counts_layer)
             
             if de_score < min_score:
                 print(f"Final validation: merging cluster {cluster} ({cluster_size} cells) with nearest cluster {nearest_cluster} ({nearest_cluster_size} cells) - DE score: {de_score:.2f}")
@@ -454,7 +454,7 @@ def Find_Centroids(adata, cluster_key='leiden', embedding_key='Concord', ndims=3
         centroids_df = centroids_df.dropna()
         
     return centroids_df.values
-def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=1, min_cluster_size=4, batch_key=None, n_cores=None, DE_batch_size=2048, icc_gpu=True, min_pval=0.05, pct_diff=0.7, seed=42, counts_layer=DEFAULT_COUNTS_LAYER, concord_chunked=None, concord_chunk_size=10000, backed_load_chunk_size=None):
+def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size=256, min_score=150, min_de_genes=1, min_cluster_size=4, batch_key=None, n_cores=None, DE_batch_size=2048, icc_gpu=True, max_pval=0.05, pct_diff=0.7, seed=42, counts_layer=DEFAULT_COUNTS_LAYER, concord_chunked=None, concord_chunk_size=10000, backed_load_chunk_size=None):
     """
     Performs one iteration of clustering and merging.
     Args:
@@ -470,7 +470,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
          n_cores: Number of CPU cores to use for parallel processing. Default is max(1, cpu_count() - 1).
          DE_batch_size: Batch size for GPU processing in dge_2samples.
          icc_gpu: Use GPU for ICC weight computation in dge_2samples. Set to False to force CPU.
-         min_pval: Minimum BH-adjusted p-value for a gene to be considered differentially expressed.
+         max_pval: Maximum BH-adjusted p-value for a gene to be considered differentially expressed.
          pct_diff: Minimum percentage difference threshold for DE genes. If pct_1 > pct_2: pct_diff = (pct_1-pct_2)/pct_1. If pct_2 > pct_1: pct_diff = (pct_2-pct_1)/pct_2 (default: 0.7).
          seed: Random seed for reproducibility.
          counts_layer: Layer containing raw counts for HVG and DE analysis. If absent, falls back to .raw and then .X.
@@ -665,7 +665,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
                     continue
                     
                 # Perform differential expression analysis for larger clusters
-                bayes_de_score = DE_Score(cluster_adata, sub_cluster, closest_sub_cluster, min_pct, min_log2_fc, min_de_genes, n_cores=n_cores, DE_batch_size=DE_batch_size, icc_gpu=icc_gpu, min_pval=min_pval, pct_diff=pct_diff, counts_layer=counts_layer)
+                bayes_de_score = DE_Score(cluster_adata, sub_cluster, closest_sub_cluster, min_pct, min_log2_fc, min_de_genes, n_cores=n_cores, DE_batch_size=DE_batch_size, icc_gpu=icc_gpu, max_pval=max_pval, pct_diff=pct_diff, counts_layer=counts_layer)
                 
                 if bayes_de_score < min_score:
                     cluster_adata.obs.loc[cluster_adata.obs['leiden'] == closest_sub_cluster, 'leiden'] = sub_cluster
@@ -793,7 +793,7 @@ def Clustering_Iteration(adata, ndims=30, min_pct=0.4, min_log2_fc=2, batch_size
     return adata
 
 
-def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes, DE_batch_size=2048, n_cores=None, icc_gpu=True, min_pval=0.05, pct_diff=0.7, counts_layer=DEFAULT_COUNTS_LAYER):
+def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes, DE_batch_size=2048, n_cores=None, icc_gpu=True, max_pval=0.05, pct_diff=0.7, counts_layer=DEFAULT_COUNTS_LAYER):
     """
     Calculate differential expression score between two identities.
     Args:
@@ -806,7 +806,7 @@ def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes, DE_bat
         DE_batch_size: Batch size for GPU processing in dge_2samples (default: 2048).
         n_cores: Number of CPU cores to use for parallel processing. Default is max(1, cpu_count() - 1).
         icc_gpu: Use GPU for ICC weight computation in dge_2samples. Set to False to force CPU.
-        min_pval: Minimum BH-adjusted p-value for a gene to be considered differentially expressed (default: 0.05).
+        max_pval: Maximum BH-adjusted p-value for a gene to be considered differentially expressed (default: 0.05).
         pct_diff: Minimum percentage difference threshold for DE genes. If pct_1 > pct_2: pct_diff = (pct_1-pct_2)/pct_1. If pct_2 > pct_1: pct_diff = (pct_2-pct_1)/pct_2 (default: 0.7).
         counts_layer: Layer containing raw counts for DE analysis. If absent, falls back to .raw and then .X.
     Returns:
@@ -835,7 +835,7 @@ def DE_Score(adata, ident_1, ident_2, min_pct, min_log2_fc, min_de_genes, DE_bat
     # Count number of DE genes meeting criteria
     de_genes = de_results[
         (abs(de_results['log2FC']) >= min_log2_fc) &
-        (de_results['p.value.adj'] <= min_pval) & (de_results['Chi2.p.value'] <= 0.05)
+        (de_results['p.value.adj'] <= max_pval) & (de_results['Chi2.p.value'] <= 0.05)
     ]
 
     de_genes = de_genes[(de_genes['pct.1'] >= min_pct) | (de_genes['pct.2'] >= min_pct)]
