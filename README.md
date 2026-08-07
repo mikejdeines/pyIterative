@@ -1,10 +1,10 @@
-# pyIterative
+# scRefine
 A package for iterative clustering based on CONCORD and weighted t-tests.
 
 To install:
 ```
-git clone https://github.com/mikejdeines/pyIterative
-cd pyIterative
+git clone https://github.com/mikejdeines/scRefine
+cd scRefine
 pip install .
 ```
 
@@ -36,6 +36,6 @@ when `adata.isbacked` is true, or you can set `concord_chunked=True` and control
 `concord_chunk_size`. Scanpy HVG, graph construction, and DE steps still materialize cluster slices; for
 backed AnnData these reads can be staged with `backed_load_chunk_size`.
 
-If you find this package useful, please cite the following papers:
+If you find this package useful, please cite the following papers alongside this repository:
 Margolin, G. et al. Cell Reports Methods 0, (2026)
 Zhu, Q. et al. Nat Biotechnol 1–15 (2026)
